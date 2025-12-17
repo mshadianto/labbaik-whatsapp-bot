@@ -44,21 +44,22 @@ class WAHAService:
     
     async def send_message(
         self, 
-        phone: str, 
+        chat_id: str, 
         message: str,
         reply_to: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Send a text message to a WhatsApp number
+        Send a text message to a WhatsApp chat
         
         Args:
-            phone: Phone number (without @c.us)
+            chat_id: Chat ID with suffix (e.g., "628xxx@c.us" or "123xxx@lid")
             message: Text message to send
             reply_to: Optional message ID to reply to
         """
-        # Clean phone number
-        phone = self._clean_phone(phone)
-        chat_id = f"{phone}@c.us"
+        # Ensure chat_id has proper format
+        if "@" not in chat_id:
+            # If no suffix, assume @c.us for phone numbers
+            chat_id = f"{self._clean_phone(chat_id)}@c.us"
         
         payload = {
             "chatId": chat_id,
@@ -78,7 +79,7 @@ class WAHAService:
                 )
                 
                 if response.status_code == 200 or response.status_code == 201:
-                    logger.info(f"✅ Message sent to {phone}")
+                    logger.info(f"✅ Message sent to {chat_id}")
                     return response.json()
                 else:
                     logger.error(f"❌ Failed to send message: {response.status_code} - {response.text}")
@@ -90,13 +91,13 @@ class WAHAService:
     
     async def send_image(
         self,
-        phone: str,
+        chat_id: str,
         image_url: str,
         caption: Optional[str] = None
     ) -> Dict[str, Any]:
         """Send an image message"""
-        phone = self._clean_phone(phone)
-        chat_id = f"{phone}@c.us"
+        if "@" not in chat_id:
+            chat_id = f"{self._clean_phone(chat_id)}@c.us"
         
         payload = {
             "chatId": chat_id,
@@ -118,7 +119,7 @@ class WAHAService:
                 )
                 
                 if response.status_code in [200, 201]:
-                    logger.info(f"✅ Image sent to {phone}")
+                    logger.info(f"✅ Image sent to {chat_id}")
                     return response.json()
                 else:
                     raise Exception(f"Send image failed: {response.status_code}")
@@ -129,14 +130,14 @@ class WAHAService:
     
     async def send_document(
         self,
-        phone: str,
+        chat_id: str,
         document_url: str,
         filename: str,
         caption: Optional[str] = None
     ) -> Dict[str, Any]:
         """Send a document/file"""
-        phone = self._clean_phone(phone)
-        chat_id = f"{phone}@c.us"
+        if "@" not in chat_id:
+            chat_id = f"{self._clean_phone(chat_id)}@c.us"
         
         payload = {
             "chatId": chat_id,
@@ -159,7 +160,7 @@ class WAHAService:
                 )
                 
                 if response.status_code in [200, 201]:
-                    logger.info(f"✅ Document sent to {phone}")
+                    logger.info(f"✅ Document sent to {chat_id}")
                     return response.json()
                 else:
                     raise Exception(f"Send document failed: {response.status_code}")
@@ -170,7 +171,7 @@ class WAHAService:
     
     async def send_buttons(
         self,
-        phone: str,
+        chat_id: str,
         message: str,
         buttons: List[Dict[str, str]],
         footer: Optional[str] = None
@@ -179,13 +180,13 @@ class WAHAService:
         Send a message with buttons (if supported by WAHA version)
         
         Args:
-            phone: Phone number
+            chat_id: Chat ID
             message: Main message text
             buttons: List of {"id": "btn_1", "text": "Button Text"}
             footer: Optional footer text
         """
-        phone = self._clean_phone(phone)
-        chat_id = f"{phone}@c.us"
+        if "@" not in chat_id:
+            chat_id = f"{self._clean_phone(chat_id)}@c.us"
         
         payload = {
             "chatId": chat_id,
@@ -211,17 +212,17 @@ class WAHAService:
                     # Fallback to regular text if buttons not supported
                     logger.warning("Buttons not supported, falling back to text")
                     button_text = "\n".join([f"• {b['text']}" for b in buttons])
-                    return await self.send_message(phone, f"{message}\n\n{button_text}")
+                    return await self.send_message(chat_id, f"{message}\n\n{button_text}")
         
         except Exception as e:
             logger.error(f"❌ Send buttons error: {e}")
             # Fallback to text
             button_text = "\n".join([f"• {b['text']}" for b in buttons])
-            return await self.send_message(phone, f"{message}\n\n{button_text}")
+            return await self.send_message(chat_id, f"{message}\n\n{button_text}")
     
     async def send_list(
         self,
-        phone: str,
+        chat_id: str,
         message: str,
         button_text: str,
         sections: List[Dict[str, Any]]
@@ -230,13 +231,13 @@ class WAHAService:
         Send a list message (if supported)
         
         Args:
-            phone: Phone number
+            chat_id: Chat ID
             message: Main message text
             button_text: Text for the list button
             sections: List of sections with rows
         """
-        phone = self._clean_phone(phone)
-        chat_id = f"{phone}@c.us"
+        if "@" not in chat_id:
+            chat_id = f"{self._clean_phone(chat_id)}@c.us"
         
         payload = {
             "chatId": chat_id,
@@ -259,23 +260,23 @@ class WAHAService:
                 else:
                     # Fallback to regular text
                     logger.warning("List not supported, falling back to text")
-                    return await self.send_message(phone, message)
+                    return await self.send_message(chat_id, message)
         
         except Exception as e:
             logger.error(f"❌ Send list error: {e}")
-            return await self.send_message(phone, message)
+            return await self.send_message(chat_id, message)
     
     async def send_location(
         self,
-        phone: str,
+        chat_id: str,
         latitude: float,
         longitude: float,
         name: Optional[str] = None,
         address: Optional[str] = None
     ) -> Dict[str, Any]:
         """Send a location message"""
-        phone = self._clean_phone(phone)
-        chat_id = f"{phone}@c.us"
+        if "@" not in chat_id:
+            chat_id = f"{self._clean_phone(chat_id)}@c.us"
         
         payload = {
             "chatId": chat_id,
@@ -357,18 +358,15 @@ class WAHAService:
             logger.debug(f"Stop typing error: {e}")
             return False
     
-    async def get_contact_info(self, phone: str) -> Optional[Dict[str, Any]]:
+    async def get_contact_info(self, chat_id: str) -> Optional[Dict[str, Any]]:
         """Get contact information"""
-        phone = self._clean_phone(phone)
-        contact_id = f"{phone}@c.us"
-        
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.get(
                     f"{self.base_url}/api/contacts",
                     headers=self.headers,
                     params={
-                        "contactId": contact_id,
+                        "contactId": chat_id,
                         "session": self.session
                     }
                 )
@@ -383,8 +381,8 @@ class WAHAService:
     
     def _clean_phone(self, phone: str) -> str:
         """Clean phone number, removing non-digits and @c.us suffix"""
-        # Remove @c.us if present
-        phone = phone.replace("@c.us", "")
+        # Remove @c.us or @lid if present
+        phone = phone.split("@")[0] if "@" in phone else phone
         # Remove non-digit characters except +
         phone = ''.join(c for c in phone if c.isdigit() or c == '+')
         # Remove + if present
@@ -396,4 +394,4 @@ class WAHAService:
     
     def extract_phone_from_jid(self, jid: str) -> str:
         """Extract phone number from WhatsApp JID"""
-        return jid.replace("@c.us", "").replace("@s.whatsapp.net", "")
+        return jid.split("@")[0] if "@" in jid else jid
