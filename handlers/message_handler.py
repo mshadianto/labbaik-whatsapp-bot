@@ -37,6 +37,7 @@ class MessageHandler:
         Args:
             payload: WAHA webhook payload
         """
+        chat_id = None
         try:
             message_data = payload.get("payload", {})
             
@@ -46,7 +47,8 @@ class MessageHandler:
             
             # Extract message details
             from_jid = message_data.get("from", "")
-            phone = self.waha.extract_phone_from_jid(from_jid)
+            chat_id = from_jid  # Keep full chat ID for reply (e.g., "123@lid" or "628xxx@c.us")
+            phone = self._extract_phone_for_db(from_jid)  # Clean version for database
             body = message_data.get("body", "").strip()
             message_id = message_data.get("id")
             has_media = message_data.get("hasMedia", False)
@@ -55,7 +57,7 @@ class MessageHandler:
             if not body and not has_media:
                 return
             
-            logger.info(f"📩 Message from {phone}: {body[:50]}...")
+            logger.info(f"📩 Message from {chat_id}: {body[:50]}...")
             
             # Check if user is blocked
             if await self.db.is_user_blocked(phone):
@@ -67,10 +69,10 @@ class MessageHandler:
             is_new_user = user.get("is_new", False)
             
             # Show typing indicator
-            await self.waha.start_typing(from_jid)
+            await self.waha.start_typing(chat_id)
             
             # Mark as read
-            await self.waha.mark_as_read(from_jid)
+            await self.waha.mark_as_read(chat_id)
             
             # Classify intent
             intent_result = await self.ai.classify_intent(body)
@@ -89,25 +91,32 @@ class MessageHandler:
             # Handle based on intent
             response = await self._route_intent(intent, body, phone, is_new_user)
             
-            # Send response
-            await self.waha.stop_typing(from_jid)
-            await self.waha.send_message(phone, response)
+            # Send response using original chat_id (preserves @lid or @c.us format)
+            await self.waha.stop_typing(chat_id)
+            await self.waha.send_message(chat_id, response)
             
             # Save bot response to conversation history
             await self.db.save_conversation(phone, "assistant", response)
             
-            logger.info(f"✅ Response sent to {phone}")
+            logger.info(f"✅ Response sent to {chat_id}")
         
         except Exception as e:
             logger.error(f"❌ Error handling message: {e}")
             # Try to send error message
             try:
-                await self.waha.send_message(
-                    phone,
-                    "Mohon maaf, terjadi kesalahan. Silakan coba lagi atau ketik MENU."
-                )
+                if chat_id:
+                    await self.waha.send_message(
+                        chat_id,
+                        "Mohon maaf, terjadi kesalahan. Silakan coba lagi atau ketik MENU."
+                    )
             except:
                 pass
+    
+    def _extract_phone_for_db(self, jid: str) -> str:
+        """Extract phone number from JID for database storage"""
+        # Remove suffix (@c.us, @lid, @s.whatsapp.net)
+        phone = jid.split("@")[0] if "@" in jid else jid
+        return phone
     
     async def _route_intent(
         self,
