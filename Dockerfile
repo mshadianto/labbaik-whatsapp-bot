@@ -35,4 +35,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=5 \
 
 # PERINTAH UTAMA (Shell Form)
 # Tidak menggunakan tanda kurung [] agar variabel ${PORT} terbaca oleh shell
-CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
+CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
