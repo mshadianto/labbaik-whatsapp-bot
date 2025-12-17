@@ -1,0 +1,25 @@
+# LABBAIK.AI WhatsApp Bot - Dependencies
+
+# Web Framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+
+# HTTP Client
+httpx==0.26.0
+
+# AI
+groq==0.4.2
+
+# Database
+asyncpg==0.29.0
+
+# Settings
+pydantic==2.5.3
+pydantic-settings==2.1.0
+
+# Utilities
+python-dotenv==1.0.0
+python-multipart==0.0.6
+
+# Optional: for production
+gunicorn==21.2.0
