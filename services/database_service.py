@@ -5,6 +5,7 @@ Service for PostgreSQL database operations
 """
 
 import logging
+import json
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
 import asyncpg
@@ -159,10 +160,13 @@ class DatabaseService:
         
         try:
             async with self.pool.acquire() as conn:
+                # Convert metadata dict to JSON string
+                metadata_json = json.dumps(metadata or {})
+                
                 await conn.execute(
                     """INSERT INTO wa_conversations (phone, role, content, metadata)
                        VALUES ($1, $2, $3, $4)""",
-                    phone, role, content, metadata or {}
+                    phone, role, content, metadata_json
                 )
         except Exception as e:
             logger.error(f"Error saving conversation: {e}")
@@ -223,10 +227,13 @@ class DatabaseService:
         
         try:
             async with self.pool.acquire() as conn:
+                # Convert data dict to JSON string
+                data_json = json.dumps(data or {})
+                
                 await conn.execute(
                     """INSERT INTO wa_analytics (event_type, phone, data)
                        VALUES ($1, $2, $3)""",
-                    event_type, phone, data or {}
+                    event_type, phone, data_json
                 )
         except Exception as e:
             logger.error(f"Error logging analytics: {e}")
@@ -306,11 +313,14 @@ class DatabaseService:
         
         try:
             async with self.pool.acquire() as conn:
+                # Convert update dict to JSON string for the || operator
+                update_json = json.dumps({"block_reason": reason})
+                
                 await conn.execute(
                     """UPDATE wa_users SET is_blocked = TRUE,
                        preferences = preferences || $2
                        WHERE phone = $1""",
-                    phone, {"block_reason": reason}
+                    phone, update_json
                 )
                 await self.log_analytics("user_blocked", phone, {"reason": reason})
         except Exception as e:
