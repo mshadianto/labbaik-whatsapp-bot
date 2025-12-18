@@ -1,16 +1,17 @@
 """
-LABBAIK.AI WhatsApp Bot - Message Handler (Optimized)
-======================================================
+LABBAIK.AI WhatsApp Bot - Message Handler (Enhanced v2)
+========================================================
 Main handler for processing incoming WhatsApp messages
-With improved typing simulation and anti-ban measures
+With improved typing simulation, anti-ban measures, and daily limits
 """
 
 import logging
 import re
 import asyncio
 import random
+import json
 from typing import Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, date
 
 from services.waha_service import WAHAService
 from services.ai_service import AIService
@@ -22,6 +23,17 @@ logger = logging.getLogger(__name__)
 
 class MessageHandler:
     """Handler for processing incoming WhatsApp messages"""
+    
+    # Configuration constants
+    RATE_LIMIT_PER_MINUTE = 10          # Max messages per minute
+    DAILY_MESSAGE_LIMIT = 100            # Max messages per day per user
+    DAILY_AI_CHAT_LIMIT = 30             # Max AI chat (heavy) per day
+    MIN_DELAY_AFTER_READ = 1.5           # Min seconds after read before typing
+    MAX_DELAY_AFTER_READ = 3.0           # Max seconds after read before typing
+    TYPING_DURATION_SHORT = (3, 5)       # Typing duration for short responses
+    TYPING_DURATION_MEDIUM = (5, 8)      # Typing duration for medium responses
+    TYPING_DURATION_LONG = (8, 12)       # Typing duration for long/AI responses
+    COOLDOWN_AFTER_LONG_RESPONSE = 2.0   # Extra delay after sending long response
     
     def __init__(
         self,
@@ -36,6 +48,10 @@ class MessageHandler:
         # Anti-spam: Track message timestamps per user
         self._user_last_message: Dict[str, datetime] = {}
         self._user_message_count: Dict[str, int] = {}
+        
+        # Daily limits tracking
+        self._daily_stats: Dict[str, Dict[str, Any]] = {}
+        self._current_date: date = date.today()
     
     async def handle_incoming_message(self, payload: Dict[str, Any]):
         """
@@ -45,6 +61,8 @@ class MessageHandler:
             payload: WAHA webhook payload
         """
         chat_id = None
+        response_sent = False
+        
         try:
             message_data = payload.get("payload", {})
             
@@ -56,13 +74,17 @@ class MessageHandler:
             from_jid = message_data.get("from", "")
             
             # === ANTI-BAN: Skip non-chat messages ===
-            # Ignore status broadcasts, groups (for now), and invalid JIDs
             if not from_jid or "status@broadcast" in from_jid:
                 logger.debug(f"Skipping non-chat message: {from_jid}")
                 return
             
-            chat_id = from_jid  # Keep full chat ID for reply (e.g., "123@lid" or "628xxx@c.us")
-            phone = self._extract_phone_for_db(from_jid)  # Clean version for database
+            # Skip group messages (optional - uncomment if needed)
+            # if "@g.us" in from_jid:
+            #     logger.debug(f"Skipping group message: {from_jid}")
+            #     return
+            
+            chat_id = from_jid
+            phone = self._extract_phone_for_db(from_jid)
             
             # Handle None body gracefully
             body = (message_data.get("body") or "").strip()
@@ -75,80 +97,117 @@ class MessageHandler:
             
             logger.info(f"📩 Message from {chat_id}: {body[:50]}...")
             
-            # === ANTI-SPAM: Rate limiting ===
-            if not await self._check_rate_limit(phone):
-                logger.warning(f"⚠️ Rate limit exceeded for {phone}")
-                return  # Silently ignore, don't respond
-            
             # === STEP 1: Mark as Read IMMEDIATELY ===
-            # This gives instant "blue tick" feedback to user
+            # User sees blue tick instantly = "Bot is active!"
             await self.waha.mark_as_read(chat_id)
+            logger.debug(f"✓✓ Marked as read: {chat_id}")
+            
+            # === ANTI-SPAM: Rate limiting (per minute) ===
+            if not self._check_rate_limit(phone):
+                logger.warning(f"⚠️ Rate limit exceeded for {phone}")
+                return  # Silently ignore
+            
+            # === DAILY LIMIT CHECK ===
+            daily_check = self._check_daily_limit(phone)
+            if not daily_check["allowed"]:
+                # Send limit reached message (only once per day)
+                if not daily_check.get("notified_today"):
+                    await self._send_limit_reached_message(chat_id, daily_check["reason"])
+                    self._mark_limit_notified(phone)
+                return
             
             # Check if user is blocked
             if await self.db.is_user_blocked(phone):
                 logger.info(f"⛔ Blocked user attempted contact: {phone}")
                 return
             
+            # === STEP 2: Natural delay before typing ===
+            # Simulates human "reading" the message
+            read_delay = random.uniform(self.MIN_DELAY_AFTER_READ, self.MAX_DELAY_AFTER_READ)
+            logger.debug(f"⏳ Reading delay: {read_delay:.1f}s")
+            await asyncio.sleep(read_delay)
+            
+            # === STEP 3: Start typing indicator ===
+            await self.waha.start_typing(chat_id)
+            logger.debug(f"⌨️ Started typing for {chat_id}")
+            
             # Get or create user
             user = await self.db.get_or_create_user(phone)
             is_new_user = user.get("is_new", False)
             
-            # === STEP 2: Start typing indicator ===
-            await self.waha.start_typing(chat_id)
-            
-            # Classify intent
+            # Classify intent (while typing is shown)
             intent_result = await self.ai.classify_intent(body)
             intent = intent_result.get("intent", "ai_chat")
             
-            # Log analytics (fire and forget, don't block)
+            # Log analytics (fire and forget)
             asyncio.create_task(self._log_analytics_safe(phone, intent, body, has_media))
             
             # Save user message to conversation history
-            await self.db.save_conversation(phone, "user", body)
+            asyncio.create_task(self._save_conversation_safe(phone, "user", body))
             
-            # Handle based on intent
-            response = await self._route_intent(intent, body, phone, is_new_user)
+            # Check AI chat daily limit
+            if intent == "ai_chat":
+                if not self._check_ai_chat_limit(phone):
+                    response = self._get_ai_limit_message()
+                    intent = "limit_reached"
+                else:
+                    self._increment_ai_chat_count(phone)
+                    response = await self._route_intent(intent, body, phone, is_new_user)
+            else:
+                response = await self._route_intent(intent, body, phone, is_new_user)
             
-            # === STEP 3: Smart typing delay based on response length ===
-            # This makes the bot feel more "human"
-            await self._smart_typing_delay(response, chat_id)
+            # === STEP 4: Smart typing duration ===
+            # Keep typing indicator active for realistic duration
+            await self._simulate_typing(response, chat_id, intent)
             
-            # === STEP 4: Stop typing and send response ===
+            # === STEP 5: Stop typing ===
             await self.waha.stop_typing(chat_id)
             
-            # === ANTI-BAN: Add small random delay before sending ===
-            await asyncio.sleep(random.uniform(0.3, 0.8))
+            # === STEP 6: Random micro-delay before sending ===
+            # Prevents detection of automated responses
+            send_delay = random.uniform(0.3, 0.8)
+            await asyncio.sleep(send_delay)
             
+            # === STEP 7: Send response ===
             await self.waha.send_message(chat_id, response)
+            response_sent = True
             
-            # Save bot response to conversation history
-            await self.db.save_conversation(phone, "assistant", response)
+            # Save bot response
+            asyncio.create_task(self._save_conversation_safe(phone, "assistant", response))
             
-            logger.info(f"✅ Response sent to {chat_id} ({len(response)} chars)")
+            # Update daily stats
+            self._increment_daily_count(phone)
+            
+            logger.info(f"✅ Response sent to {chat_id} ({len(response)} chars, intent: {intent})")
+            
+            # === STEP 8: Cooldown after long response ===
+            if len(response) > 1000:
+                await asyncio.sleep(self.COOLDOWN_AFTER_LONG_RESPONSE)
         
         except Exception as e:
             logger.error(f"❌ Error handling message: {e}", exc_info=True)
+            
             # Try to send error message
-            try:
-                if chat_id and not "status@broadcast" in str(chat_id):
+            if chat_id and not response_sent and "status@broadcast" not in str(chat_id):
+                try:
                     await self.waha.stop_typing(chat_id)
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(1.0)
                     await self.waha.send_message(
                         chat_id,
-                        "Mohon maaf, terjadi kesalahan. Silakan coba lagi atau ketik MENU."
+                        "Mohon maaf, terjadi kesalahan. Silakan coba lagi atau ketik *MENU*."
                     )
-            except:
-                pass
+                except Exception as send_error:
+                    logger.error(f"Failed to send error message: {send_error}")
+    
+    # ==================== HELPER METHODS ====================
     
     def _extract_phone_for_db(self, jid: str) -> str:
         """Extract phone number from JID for database storage"""
-        # Remove suffix (@c.us, @lid, @s.whatsapp.net)
-        phone = jid.split("@")[0] if "@" in jid else jid
-        return phone
+        return jid.split("@")[0] if "@" in jid else jid
     
-    async def _check_rate_limit(self, phone: str) -> bool:
+    def _check_rate_limit(self, phone: str) -> bool:
         """
-        Anti-spam: Check if user is sending too many messages
+        Check if user is sending too many messages per minute
         Returns True if allowed, False if rate limited
         """
         now = datetime.now()
@@ -159,40 +218,132 @@ class MessageHandler:
             if time_diff > 60:
                 self._user_message_count[phone] = 0
         
-        # Update tracking
         self._user_last_message[phone] = now
         self._user_message_count[phone] = self._user_message_count.get(phone, 0) + 1
         
-        # Allow max 10 messages per minute
-        if self._user_message_count[phone] > 10:
-            return False
-        
-        return True
+        return self._user_message_count[phone] <= self.RATE_LIMIT_PER_MINUTE
     
-    async def _smart_typing_delay(self, response: str, chat_id: str):
+    def _reset_daily_stats_if_needed(self):
+        """Reset daily stats if it's a new day"""
+        today = date.today()
+        if today != self._current_date:
+            logger.info(f"📅 New day detected, resetting daily stats")
+            self._daily_stats = {}
+            self._current_date = today
+    
+    def _get_user_daily_stats(self, phone: str) -> Dict[str, Any]:
+        """Get or create daily stats for user"""
+        self._reset_daily_stats_if_needed()
+        
+        if phone not in self._daily_stats:
+            self._daily_stats[phone] = {
+                "message_count": 0,
+                "ai_chat_count": 0,
+                "limit_notified": False,
+                "first_message": datetime.now()
+            }
+        return self._daily_stats[phone]
+    
+    def _check_daily_limit(self, phone: str) -> Dict[str, Any]:
+        """Check if user has exceeded daily message limit"""
+        stats = self._get_user_daily_stats(phone)
+        
+        if stats["message_count"] >= self.DAILY_MESSAGE_LIMIT:
+            return {
+                "allowed": False,
+                "reason": "daily_limit",
+                "notified_today": stats["limit_notified"]
+            }
+        
+        return {"allowed": True}
+    
+    def _check_ai_chat_limit(self, phone: str) -> bool:
+        """Check if user has exceeded daily AI chat limit"""
+        stats = self._get_user_daily_stats(phone)
+        return stats["ai_chat_count"] < self.DAILY_AI_CHAT_LIMIT
+    
+    def _increment_daily_count(self, phone: str):
+        """Increment daily message count"""
+        stats = self._get_user_daily_stats(phone)
+        stats["message_count"] += 1
+    
+    def _increment_ai_chat_count(self, phone: str):
+        """Increment AI chat count"""
+        stats = self._get_user_daily_stats(phone)
+        stats["ai_chat_count"] += 1
+    
+    def _mark_limit_notified(self, phone: str):
+        """Mark that user has been notified about limit"""
+        stats = self._get_user_daily_stats(phone)
+        stats["limit_notified"] = True
+    
+    async def _send_limit_reached_message(self, chat_id: str, reason: str):
+        """Send message when user reaches daily limit"""
+        await self.waha.start_typing(chat_id)
+        await asyncio.sleep(2)
+        await self.waha.stop_typing(chat_id)
+        
+        message = """⚠️ *Batas Harian Tercapai*
+
+Mohon maaf, Anda telah mencapai batas penggunaan harian.
+
+Batas akan direset pada pukul 00:00 WIB.
+
+Terima kasih atas pengertiannya! 🙏
+
+🌐 Kunjungi website kami untuk informasi lebih lanjut:
+labbaik-umrahplanner.streamlit.app"""
+        
+        await self.waha.send_message(chat_id, message)
+    
+    def _get_ai_limit_message(self) -> str:
+        """Get message when AI chat limit is reached"""
+        return """⚠️ *Batas AI Chat Harian Tercapai*
+
+Anda telah menggunakan {}/{}x AI chat hari ini.
+
+💡 *Alternatif:*
+• Ketik *MENU* untuk akses fitur lain
+• Ketik *1* untuk panduan Umrah
+• Ketik *2* untuk doa-doa
+• Ketik *3* untuk simulasi biaya
+
+Batas AI chat akan direset besok pukul 00:00 WIB.
+
+🌐 Website: labbaik-umrahplanner.streamlit.app""".format(
+            self.DAILY_AI_CHAT_LIMIT, 
+            self.DAILY_AI_CHAT_LIMIT
+        )
+    
+    async def _simulate_typing(self, response: str, chat_id: str, intent: str):
         """
-        Simulate human-like typing delay based on response length
-        This makes the bot feel more natural and reduces ban risk
+        Simulate realistic typing duration based on response length and type
+        Re-triggers typing every 5 seconds to keep indicator active
         """
         response_len = len(response)
         
-        # Calculate delay: longer response = longer "thinking" time
-        if response_len < 100:
-            delay = random.uniform(0.5, 1.0)  # Short response
+        # Determine typing duration based on response type
+        if intent in ["greeting", "menu", "thanks", "bye"]:
+            # Quick responses - shorter typing
+            duration = random.uniform(*self.TYPING_DURATION_SHORT)
         elif response_len < 500:
-            delay = random.uniform(1.0, 2.0)  # Medium response
-        elif response_len < 1000:
-            delay = random.uniform(2.0, 3.0)  # Long response
+            # Medium responses
+            duration = random.uniform(*self.TYPING_DURATION_MEDIUM)
         else:
-            delay = random.uniform(2.5, 4.0)  # Very long response (AI generated)
+            # Long responses (AI generated, guides, etc.)
+            duration = random.uniform(*self.TYPING_DURATION_LONG)
         
-        # Keep typing indicator active during delay
-        # Re-trigger typing every 2 seconds if delay is long
+        logger.debug(f"⌨️ Typing simulation: {duration:.1f}s for {response_len} chars")
+        
+        # Keep typing indicator active by re-triggering every 5 seconds
         elapsed = 0
-        while elapsed < delay:
-            await asyncio.sleep(min(2.0, delay - elapsed))
-            elapsed += 2.0
-            if elapsed < delay:
+        while elapsed < duration:
+            wait_time = min(5.0, duration - elapsed)
+            await asyncio.sleep(wait_time)
+            elapsed += wait_time
+            
+            # Re-trigger typing if more time remaining
+            if elapsed < duration:
                 await self.waha.start_typing(chat_id)
     
     async def _log_analytics_safe(self, phone: str, intent: str, body: str, has_media: bool):
@@ -201,10 +352,18 @@ class MessageHandler:
             await self.db.log_analytics("message_received", phone, {
                 "intent": intent,
                 "message_length": len(body),
-                "has_media": has_media
+                "has_media": has_media,
+                "timestamp": datetime.now().isoformat()
             })
         except Exception as e:
             logger.debug(f"Analytics logging failed (non-critical): {e}")
+    
+    async def _save_conversation_safe(self, phone: str, role: str, content: str):
+        """Save conversation without blocking main flow"""
+        try:
+            await self.db.save_conversation(phone, role, content)
+        except Exception as e:
+            logger.debug(f"Conversation save failed (non-critical): {e}")
     
     async def _route_intent(
         self,
@@ -238,6 +397,8 @@ class MessageHandler:
         handler = handlers.get(intent, self._handle_ai_chat)
         return await handler(message, phone)
     
+    # ==================== INTENT HANDLERS ====================
+    
     async def _handle_new_user(self) -> str:
         """Handle new user welcome"""
         return """🕌 *Assalamu'alaikum Warahmatullahi Wabarakatuh!*
@@ -250,7 +411,7 @@ Saya siap membantu Anda merencanakan ibadah Umrah dengan mudah dan informatif.
 • Panduan tata cara Umrah lengkap
 • Simulasi biaya & budgeting
 • Checklist persiapan
-• Doa-doa Umrah dengan audio
+• Doa-doa Umrah
 • Info visa & persyaratan
 • Hak-hak jamaah resmi
 
@@ -272,8 +433,6 @@ _Semoga Allah memudahkan perjalanan Umrah Anda_ 🤲"""
         """Handle cost/pricing inquiries"""
         message_lower = message.lower()
         
-        # Check for specific simulation request
-        # Format: SIMULASI 9hari Maret standar
         sim_pattern = r'simulasi\s+(\d+)\s*(?:hari|days?)?\s+(\w+)\s+(\w+)'
         match = re.search(sim_pattern, message_lower)
         
@@ -281,11 +440,8 @@ _Semoga Allah memudahkan perjalanan Umrah Anda_ 🤲"""
             duration = int(match.group(1))
             month = match.group(2)
             tier = match.group(3)
-            
-            # Generate detailed simulation via AI
             return await self.ai.generate_cost_simulation(duration, month, tier)
         
-        # Return general cost menu
         return MENU_TEMPLATES["simulasi_biaya"]
     
     async def _handle_guide(self, message: str, phone: str) -> str:
@@ -307,7 +463,6 @@ _Semoga Allah memudahkan perjalanan Umrah Anda_ 🤲"""
         """Handle doa/dzikir requests"""
         message_lower = message.lower()
         
-        # Check for specific doa
         if any(word in message_lower for word in ['niat', 'niat umrah']):
             return DOA_TEMPLATES["niat_umrah"]
         elif 'talbiyah' in message_lower or 'labbaik' in message_lower:
@@ -343,7 +498,6 @@ _Semoga Allah memudahkan perjalanan Umrah Anda_ 🤲"""
         """Handle jamaah rights inquiries"""
         message_lower = message.lower()
         
-        # Check for specific right number
         number_match = re.search(r'hak\s+(\d+)', message_lower)
         if number_match:
             right_num = int(number_match.group(1))
@@ -379,13 +533,11 @@ _Sampai jumpa, semoga Allah selalu melindungi_ 🤲"""
     
     async def _handle_ai_chat(self, message: str, phone: str) -> str:
         """Handle general AI chat for unrecognized intents"""
-        # Get conversation history for context
         history = await self.db.get_conversation_history(
             phone, 
             settings.MAX_CONVERSATION_HISTORY
         )
         
-        # Generate AI response
         response = await self.ai.generate_response(
             message,
             conversation_history=history
@@ -393,7 +545,7 @@ _Sampai jumpa, semoga Allah selalu melindungi_ 🤲"""
         
         return response
     
-    # ============ Helper methods for detailed content ============
+    # ==================== GUIDE CONTENT ====================
     
     async def _get_ihram_guide(self) -> str:
         """Get detailed ihram guide"""
@@ -582,6 +734,6 @@ Ada pertanyaan lain?"""
 📚 Sumber: Dokumen Hak Jamaah Umrah 1446H
 Kementerian Haji & Umrah Saudi Arabia
 
-Ketik HAK untuk melihat daftar lengkap."""
+Ketik *HAK* untuk melihat daftar lengkap."""
         else:
-            return f"Hak nomor {right_num} tidak ditemukan. Ketik HAK untuk daftar lengkap (1-29)."
+            return f"Hak nomor {right_num} tidak ditemukan. Ketik *HAK* untuk daftar lengkap (1-29)."
