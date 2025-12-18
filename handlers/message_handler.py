@@ -1,11 +1,14 @@
 """
-LABBAIK.AI WhatsApp Bot - Message Handler
-==========================================
+LABBAIK.AI WhatsApp Bot - Message Handler (Optimized)
+======================================================
 Main handler for processing incoming WhatsApp messages
+With improved typing simulation and anti-ban measures
 """
 
 import logging
 import re
+import asyncio
+import random
 from typing import Dict, Any, Optional
 from datetime import datetime
 
@@ -29,6 +32,10 @@ class MessageHandler:
         self.waha = waha_service
         self.ai = ai_service
         self.db = db_service
+        
+        # Anti-spam: Track message timestamps per user
+        self._user_last_message: Dict[str, datetime] = {}
+        self._user_message_count: Dict[str, int] = {}
     
     async def handle_incoming_message(self, payload: Dict[str, Any]):
         """
@@ -47,9 +54,18 @@ class MessageHandler:
             
             # Extract message details
             from_jid = message_data.get("from", "")
+            
+            # === ANTI-BAN: Skip non-chat messages ===
+            # Ignore status broadcasts, groups (for now), and invalid JIDs
+            if not from_jid or "status@broadcast" in from_jid:
+                logger.debug(f"Skipping non-chat message: {from_jid}")
+                return
+            
             chat_id = from_jid  # Keep full chat ID for reply (e.g., "123@lid" or "628xxx@c.us")
             phone = self._extract_phone_for_db(from_jid)  # Clean version for database
-            body = message_data.get("body", "").strip()
+            
+            # Handle None body gracefully
+            body = (message_data.get("body") or "").strip()
             message_id = message_data.get("id")
             has_media = message_data.get("hasMedia", False)
             
@@ -58,6 +74,15 @@ class MessageHandler:
                 return
             
             logger.info(f"📩 Message from {chat_id}: {body[:50]}...")
+            
+            # === ANTI-SPAM: Rate limiting ===
+            if not await self._check_rate_limit(phone):
+                logger.warning(f"⚠️ Rate limit exceeded for {phone}")
+                return  # Silently ignore, don't respond
+            
+            # === STEP 1: Mark as Read IMMEDIATELY ===
+            # This gives instant "blue tick" feedback to user
+            await self.waha.mark_as_read(chat_id)
             
             # Check if user is blocked
             if await self.db.is_user_blocked(phone):
@@ -68,22 +93,15 @@ class MessageHandler:
             user = await self.db.get_or_create_user(phone)
             is_new_user = user.get("is_new", False)
             
-            # Show typing indicator
+            # === STEP 2: Start typing indicator ===
             await self.waha.start_typing(chat_id)
-            
-            # Mark as read
-            await self.waha.mark_as_read(chat_id)
             
             # Classify intent
             intent_result = await self.ai.classify_intent(body)
             intent = intent_result.get("intent", "ai_chat")
             
-            # Log analytics
-            await self.db.log_analytics("message_received", phone, {
-                "intent": intent,
-                "message_length": len(body),
-                "has_media": has_media
-            })
+            # Log analytics (fire and forget, don't block)
+            asyncio.create_task(self._log_analytics_safe(phone, intent, body, has_media))
             
             # Save user message to conversation history
             await self.db.save_conversation(phone, "user", body)
@@ -91,20 +109,30 @@ class MessageHandler:
             # Handle based on intent
             response = await self._route_intent(intent, body, phone, is_new_user)
             
-            # Send response using original chat_id (preserves @lid or @c.us format)
+            # === STEP 3: Smart typing delay based on response length ===
+            # This makes the bot feel more "human"
+            await self._smart_typing_delay(response, chat_id)
+            
+            # === STEP 4: Stop typing and send response ===
             await self.waha.stop_typing(chat_id)
+            
+            # === ANTI-BAN: Add small random delay before sending ===
+            await asyncio.sleep(random.uniform(0.3, 0.8))
+            
             await self.waha.send_message(chat_id, response)
             
             # Save bot response to conversation history
             await self.db.save_conversation(phone, "assistant", response)
             
-            logger.info(f"✅ Response sent to {chat_id}")
+            logger.info(f"✅ Response sent to {chat_id} ({len(response)} chars)")
         
         except Exception as e:
-            logger.error(f"❌ Error handling message: {e}")
+            logger.error(f"❌ Error handling message: {e}", exc_info=True)
             # Try to send error message
             try:
-                if chat_id:
+                if chat_id and not "status@broadcast" in str(chat_id):
+                    await self.waha.stop_typing(chat_id)
+                    await asyncio.sleep(0.5)
                     await self.waha.send_message(
                         chat_id,
                         "Mohon maaf, terjadi kesalahan. Silakan coba lagi atau ketik MENU."
@@ -117,6 +145,66 @@ class MessageHandler:
         # Remove suffix (@c.us, @lid, @s.whatsapp.net)
         phone = jid.split("@")[0] if "@" in jid else jid
         return phone
+    
+    async def _check_rate_limit(self, phone: str) -> bool:
+        """
+        Anti-spam: Check if user is sending too many messages
+        Returns True if allowed, False if rate limited
+        """
+        now = datetime.now()
+        
+        # Reset counter if last message was > 60 seconds ago
+        if phone in self._user_last_message:
+            time_diff = (now - self._user_last_message[phone]).total_seconds()
+            if time_diff > 60:
+                self._user_message_count[phone] = 0
+        
+        # Update tracking
+        self._user_last_message[phone] = now
+        self._user_message_count[phone] = self._user_message_count.get(phone, 0) + 1
+        
+        # Allow max 10 messages per minute
+        if self._user_message_count[phone] > 10:
+            return False
+        
+        return True
+    
+    async def _smart_typing_delay(self, response: str, chat_id: str):
+        """
+        Simulate human-like typing delay based on response length
+        This makes the bot feel more natural and reduces ban risk
+        """
+        response_len = len(response)
+        
+        # Calculate delay: longer response = longer "thinking" time
+        if response_len < 100:
+            delay = random.uniform(0.5, 1.0)  # Short response
+        elif response_len < 500:
+            delay = random.uniform(1.0, 2.0)  # Medium response
+        elif response_len < 1000:
+            delay = random.uniform(2.0, 3.0)  # Long response
+        else:
+            delay = random.uniform(2.5, 4.0)  # Very long response (AI generated)
+        
+        # Keep typing indicator active during delay
+        # Re-trigger typing every 2 seconds if delay is long
+        elapsed = 0
+        while elapsed < delay:
+            await asyncio.sleep(min(2.0, delay - elapsed))
+            elapsed += 2.0
+            if elapsed < delay:
+                await self.waha.start_typing(chat_id)
+    
+    async def _log_analytics_safe(self, phone: str, intent: str, body: str, has_media: bool):
+        """Log analytics without blocking main flow"""
+        try:
+            await self.db.log_analytics("message_received", phone, {
+                "intent": intent,
+                "message_length": len(body),
+                "has_media": has_media
+            })
+        except Exception as e:
+            logger.debug(f"Analytics logging failed (non-critical): {e}")
     
     async def _route_intent(
         self,
