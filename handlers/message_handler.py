@@ -1,19 +1,22 @@
 """
-LABBAIK.AI WhatsApp Bot - Message Handler (Enhanced v2)
+LABBAIK.AI WhatsApp Bot - Message Handler (Enhanced v3)
 ========================================================
-Main handler for processing incoming WhatsApp messages
-With improved typing simulation, anti-ban measures, and daily limits
+With interactive buttons, audio doa, images, and rich media support
 """
 
 import logging
 import re
 import asyncio
 import random
-import json
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime, date
 
-from services.waha_service import WAHAService
+from services.waha_service import (
+    WAHAService, 
+    DOA_AUDIO_URLS, 
+    INFOGRAPHIC_URLS, 
+    LOCATIONS
+)
 from services.ai_service import AIService
 from services.database_service import DatabaseService
 from config.settings import settings, MENU_TEMPLATES, DOA_TEMPLATES
@@ -22,18 +25,18 @@ logger = logging.getLogger(__name__)
 
 
 class MessageHandler:
-    """Handler for processing incoming WhatsApp messages"""
+    """Enhanced handler with rich media support"""
     
-    # Configuration constants
-    RATE_LIMIT_PER_MINUTE = 10          # Max messages per minute
-    DAILY_MESSAGE_LIMIT = 100            # Max messages per day per user
-    DAILY_AI_CHAT_LIMIT = 30             # Max AI chat (heavy) per day
-    MIN_DELAY_AFTER_READ = 1.5           # Min seconds after read before typing
-    MAX_DELAY_AFTER_READ = 3.0           # Max seconds after read before typing
-    TYPING_DURATION_SHORT = (3, 5)       # Typing duration for short responses
-    TYPING_DURATION_MEDIUM = (5, 8)      # Typing duration for medium responses
-    TYPING_DURATION_LONG = (8, 12)       # Typing duration for long/AI responses
-    COOLDOWN_AFTER_LONG_RESPONSE = 2.0   # Extra delay after sending long response
+    # Configuration
+    RATE_LIMIT_PER_MINUTE = 10
+    DAILY_MESSAGE_LIMIT = 100
+    DAILY_AI_CHAT_LIMIT = 30
+    MIN_DELAY_AFTER_READ = 1.5
+    MAX_DELAY_AFTER_READ = 3.0
+    TYPING_DURATION_SHORT = (3, 5)
+    TYPING_DURATION_MEDIUM = (5, 8)
+    TYPING_DURATION_LONG = (8, 12)
+    COOLDOWN_AFTER_LONG_RESPONSE = 2.0
     
     def __init__(
         self,
@@ -45,511 +48,394 @@ class MessageHandler:
         self.ai = ai_service
         self.db = db_service
         
-        # Anti-spam: Track message timestamps per user
         self._user_last_message: Dict[str, datetime] = {}
         self._user_message_count: Dict[str, int] = {}
-        
-        # Daily limits tracking
         self._daily_stats: Dict[str, Dict[str, Any]] = {}
         self._current_date: date = date.today()
+        
+        # Track user conversation state for multi-step flows
+        self._user_state: Dict[str, Dict[str, Any]] = {}
     
     async def handle_incoming_message(self, payload: Dict[str, Any]):
-        """
-        Main entry point for handling incoming messages
-        
-        Args:
-            payload: WAHA webhook payload
-        """
+        """Main entry point for handling incoming messages"""
         chat_id = None
         response_sent = False
         
         try:
             message_data = payload.get("payload", {})
             
-            # Skip if message is from the bot itself
             if message_data.get("fromMe", False):
                 return
             
-            # Extract message details
             from_jid = message_data.get("from", "")
             
-            # === ANTI-BAN: Skip non-chat messages ===
             if not from_jid or "status@broadcast" in from_jid:
-                logger.debug(f"Skipping non-chat message: {from_jid}")
                 return
-            
-            # Skip group messages (optional - uncomment if needed)
-            # if "@g.us" in from_jid:
-            #     logger.debug(f"Skipping group message: {from_jid}")
-            #     return
             
             chat_id = from_jid
             phone = self._extract_phone_for_db(from_jid)
-            
-            # Handle None body gracefully
             body = (message_data.get("body") or "").strip()
             message_id = message_data.get("id")
             has_media = message_data.get("hasMedia", False)
             
-            # Skip empty messages
-            if not body and not has_media:
+            # Check for button response
+            button_id = message_data.get("selectedButtonId")
+            list_id = message_data.get("selectedRowId")
+            
+            if not body and not has_media and not button_id and not list_id:
                 return
             
-            logger.info(f"📩 Message from {chat_id}: {body[:50]}...")
+            # Use button/list ID as body if present
+            if button_id:
+                body = button_id
+                logger.info(f"📩 Button pressed from {chat_id}: {button_id}")
+            elif list_id:
+                body = list_id
+                logger.info(f"📩 List selected from {chat_id}: {list_id}")
+            else:
+                logger.info(f"📩 Message from {chat_id}: {body[:50]}...")
             
-            # === STEP 1: Mark as Read IMMEDIATELY ===
-            # User sees blue tick instantly = "Bot is active!"
+            # Mark as read immediately
             await self.waha.mark_as_read(chat_id)
-            logger.debug(f"✓✓ Marked as read: {chat_id}")
             
-            # === ANTI-SPAM: Rate limiting (per minute) ===
+            # Rate limiting
             if not self._check_rate_limit(phone):
                 logger.warning(f"⚠️ Rate limit exceeded for {phone}")
-                return  # Silently ignore
+                return
             
-            # === DAILY LIMIT CHECK ===
+            # Daily limit check
             daily_check = self._check_daily_limit(phone)
             if not daily_check["allowed"]:
-                # Send limit reached message (only once per day)
                 if not daily_check.get("notified_today"):
-                    await self._send_limit_reached_message(chat_id, daily_check["reason"])
+                    await self._send_limit_reached_message(chat_id)
                     self._mark_limit_notified(phone)
                 return
             
-            # Check if user is blocked
+            # Block check
             if await self.db.is_user_blocked(phone):
-                logger.info(f"⛔ Blocked user attempted contact: {phone}")
                 return
             
-            # === STEP 2: Natural delay before typing ===
-            # Simulates human "reading" the message
-            read_delay = random.uniform(self.MIN_DELAY_AFTER_READ, self.MAX_DELAY_AFTER_READ)
-            logger.debug(f"⏳ Reading delay: {read_delay:.1f}s")
-            await asyncio.sleep(read_delay)
-            
-            # === STEP 3: Start typing indicator ===
+            # Natural delay before typing
+            await asyncio.sleep(random.uniform(self.MIN_DELAY_AFTER_READ, self.MAX_DELAY_AFTER_READ))
             await self.waha.start_typing(chat_id)
-            logger.debug(f"⌨️ Started typing for {chat_id}")
             
-            # Get or create user
+            # Get user info
             user = await self.db.get_or_create_user(phone)
             is_new_user = user.get("is_new", False)
             
-            # Classify intent (while typing is shown)
+            # Classify intent
             intent_result = await self.ai.classify_intent(body)
             intent = intent_result.get("intent", "ai_chat")
             
-            # Log analytics (fire and forget)
-            asyncio.create_task(self._log_analytics_safe(phone, intent, body, has_media))
+            # Handle button/list responses
+            if button_id or list_id:
+                intent, body = self._handle_interactive_response(button_id or list_id)
             
-            # Save user message to conversation history
+            # Log analytics
+            asyncio.create_task(self._log_analytics_safe(phone, intent, body, has_media))
             asyncio.create_task(self._save_conversation_safe(phone, "user", body))
             
-            # Check AI chat daily limit
+            # Route and get response
             if intent == "ai_chat":
                 if not self._check_ai_chat_limit(phone):
-                    response = self._get_ai_limit_message()
-                    intent = "limit_reached"
-                else:
-                    self._increment_ai_chat_count(phone)
-                    response = await self._route_intent(intent, body, phone, is_new_user)
-            else:
-                response = await self._route_intent(intent, body, phone, is_new_user)
+                    await self._send_ai_limit_message(chat_id)
+                    return
+                self._increment_ai_chat_count(phone)
             
-            # === STEP 4: Smart typing duration ===
-            # Keep typing indicator active for realistic duration
-            await self._simulate_typing(response, chat_id, intent)
+            # Get response (may be text, buttons, audio, etc.)
+            response_data = await self._route_intent_enhanced(intent, body, phone, is_new_user)
             
-            # === STEP 5: Stop typing ===
+            # Smart typing delay
+            await self._simulate_typing(response_data, chat_id, intent)
             await self.waha.stop_typing(chat_id)
             
-            # === STEP 6: Random micro-delay before sending ===
-            # Prevents detection of automated responses
-            send_delay = random.uniform(0.3, 0.8)
-            await asyncio.sleep(send_delay)
+            # Random micro-delay
+            await asyncio.sleep(random.uniform(0.3, 0.8))
             
-            # === STEP 7: Send response ===
-            await self.waha.send_message(chat_id, response)
+            # Send response based on type
+            await self._send_response(chat_id, response_data)
             response_sent = True
             
-            # Save bot response
-            asyncio.create_task(self._save_conversation_safe(phone, "assistant", response))
+            # Save response
+            response_text = response_data.get("text", str(response_data))
+            asyncio.create_task(self._save_conversation_safe(phone, "assistant", response_text[:500]))
             
-            # Update daily stats
             self._increment_daily_count(phone)
+            logger.info(f"✅ Response sent to {chat_id} (type: {response_data.get('type', 'text')})")
             
-            logger.info(f"✅ Response sent to {chat_id} ({len(response)} chars, intent: {intent})")
-            
-            # === STEP 8: Cooldown after long response ===
-            if len(response) > 1000:
+            # Cooldown
+            if len(response_data.get("text", "")) > 1000:
                 await asyncio.sleep(self.COOLDOWN_AFTER_LONG_RESPONSE)
         
         except Exception as e:
             logger.error(f"❌ Error handling message: {e}", exc_info=True)
-            
-            # Try to send error message
-            if chat_id and not response_sent and "status@broadcast" not in str(chat_id):
+            if chat_id and not response_sent:
                 try:
                     await self.waha.stop_typing(chat_id)
                     await asyncio.sleep(1.0)
-                    await self.waha.send_message(
-                        chat_id,
-                        "Mohon maaf, terjadi kesalahan. Silakan coba lagi atau ketik *MENU*."
-                    )
-                except Exception as send_error:
-                    logger.error(f"Failed to send error message: {send_error}")
+                    await self.waha.send_message(chat_id, "Mohon maaf, terjadi kesalahan. Ketik *MENU* untuk menu utama.")
+                except:
+                    pass
     
-    # ==================== HELPER METHODS ====================
+    # ==================== RESPONSE SENDING ====================
     
-    def _extract_phone_for_db(self, jid: str) -> str:
-        """Extract phone number from JID for database storage"""
-        return jid.split("@")[0] if "@" in jid else jid
-    
-    def _check_rate_limit(self, phone: str) -> bool:
-        """
-        Check if user is sending too many messages per minute
-        Returns True if allowed, False if rate limited
-        """
-        now = datetime.now()
+    async def _send_response(self, chat_id: str, response_data: Dict[str, Any]):
+        """Send response based on type"""
+        response_type = response_data.get("type", "text")
         
-        # Reset counter if last message was > 60 seconds ago
-        if phone in self._user_last_message:
-            time_diff = (now - self._user_last_message[phone]).total_seconds()
-            if time_diff > 60:
-                self._user_message_count[phone] = 0
+        if response_type == "text":
+            await self.waha.send_message(chat_id, response_data["text"])
         
-        self._user_last_message[phone] = now
-        self._user_message_count[phone] = self._user_message_count.get(phone, 0) + 1
+        elif response_type == "buttons":
+            await self.waha.send_buttons(
+                chat_id=chat_id,
+                text=response_data["text"],
+                buttons=response_data["buttons"],
+                footer=response_data.get("footer")
+            )
         
-        return self._user_message_count[phone] <= self.RATE_LIMIT_PER_MINUTE
-    
-    def _reset_daily_stats_if_needed(self):
-        """Reset daily stats if it's a new day"""
-        today = date.today()
-        if today != self._current_date:
-            logger.info(f"📅 New day detected, resetting daily stats")
-            self._daily_stats = {}
-            self._current_date = today
-    
-    def _get_user_daily_stats(self, phone: str) -> Dict[str, Any]:
-        """Get or create daily stats for user"""
-        self._reset_daily_stats_if_needed()
+        elif response_type == "list":
+            await self.waha.send_list(
+                chat_id=chat_id,
+                text=response_data["text"],
+                button_text=response_data["button_text"],
+                sections=response_data["sections"],
+                footer=response_data.get("footer")
+            )
         
-        if phone not in self._daily_stats:
-            self._daily_stats[phone] = {
-                "message_count": 0,
-                "ai_chat_count": 0,
-                "limit_notified": False,
-                "first_message": datetime.now()
-            }
-        return self._daily_stats[phone]
-    
-    def _check_daily_limit(self, phone: str) -> Dict[str, Any]:
-        """Check if user has exceeded daily message limit"""
-        stats = self._get_user_daily_stats(phone)
-        
-        if stats["message_count"] >= self.DAILY_MESSAGE_LIMIT:
-            return {
-                "allowed": False,
-                "reason": "daily_limit",
-                "notified_today": stats["limit_notified"]
-            }
-        
-        return {"allowed": True}
-    
-    def _check_ai_chat_limit(self, phone: str) -> bool:
-        """Check if user has exceeded daily AI chat limit"""
-        stats = self._get_user_daily_stats(phone)
-        return stats["ai_chat_count"] < self.DAILY_AI_CHAT_LIMIT
-    
-    def _increment_daily_count(self, phone: str):
-        """Increment daily message count"""
-        stats = self._get_user_daily_stats(phone)
-        stats["message_count"] += 1
-    
-    def _increment_ai_chat_count(self, phone: str):
-        """Increment AI chat count"""
-        stats = self._get_user_daily_stats(phone)
-        stats["ai_chat_count"] += 1
-    
-    def _mark_limit_notified(self, phone: str):
-        """Mark that user has been notified about limit"""
-        stats = self._get_user_daily_stats(phone)
-        stats["limit_notified"] = True
-    
-    async def _send_limit_reached_message(self, chat_id: str, reason: str):
-        """Send message when user reaches daily limit"""
-        await self.waha.start_typing(chat_id)
-        await asyncio.sleep(2)
-        await self.waha.stop_typing(chat_id)
-        
-        message = """⚠️ *Batas Harian Tercapai*
-
-Mohon maaf, Anda telah mencapai batas penggunaan harian.
-
-Batas akan direset pada pukul 00:00 WIB.
-
-Terima kasih atas pengertiannya! 🙏
-
-🌐 Kunjungi website kami untuk informasi lebih lanjut:
-labbaik-umrahplanner.streamlit.app"""
-        
-        await self.waha.send_message(chat_id, message)
-    
-    def _get_ai_limit_message(self) -> str:
-        """Get message when AI chat limit is reached"""
-        return """⚠️ *Batas AI Chat Harian Tercapai*
-
-Anda telah menggunakan {}/{}x AI chat hari ini.
-
-💡 *Alternatif:*
-• Ketik *MENU* untuk akses fitur lain
-• Ketik *1* untuk panduan Umrah
-• Ketik *2* untuk doa-doa
-• Ketik *3* untuk simulasi biaya
-
-Batas AI chat akan direset besok pukul 00:00 WIB.
-
-🌐 Website: labbaik-umrahplanner.streamlit.app""".format(
-            self.DAILY_AI_CHAT_LIMIT, 
-            self.DAILY_AI_CHAT_LIMIT
-        )
-    
-    async def _simulate_typing(self, response: str, chat_id: str, intent: str):
-        """
-        Simulate realistic typing duration based on response length and type
-        Re-triggers typing every 5 seconds to keep indicator active
-        """
-        response_len = len(response)
-        
-        # Determine typing duration based on response type
-        if intent in ["greeting", "menu", "thanks", "bye"]:
-            # Quick responses - shorter typing
-            duration = random.uniform(*self.TYPING_DURATION_SHORT)
-        elif response_len < 500:
-            # Medium responses
-            duration = random.uniform(*self.TYPING_DURATION_MEDIUM)
-        else:
-            # Long responses (AI generated, guides, etc.)
-            duration = random.uniform(*self.TYPING_DURATION_LONG)
-        
-        logger.debug(f"⌨️ Typing simulation: {duration:.1f}s for {response_len} chars")
-        
-        # Keep typing indicator active by re-triggering every 5 seconds
-        elapsed = 0
-        while elapsed < duration:
-            wait_time = min(5.0, duration - elapsed)
-            await asyncio.sleep(wait_time)
-            elapsed += wait_time
+        elif response_type == "audio":
+            # Send text first, then audio
+            if response_data.get("text"):
+                await self.waha.send_message(chat_id, response_data["text"])
+                await asyncio.sleep(0.5)
             
-            # Re-trigger typing if more time remaining
-            if elapsed < duration:
-                await self.waha.start_typing(chat_id)
+            # Show recording indicator
+            await self.waha.start_recording(chat_id)
+            await asyncio.sleep(random.uniform(1.5, 2.5))
+            await self.waha.stop_recording(chat_id)
+            
+            await self.waha.send_audio(
+                chat_id=chat_id,
+                audio_url=response_data["audio_url"],
+                as_voice=response_data.get("as_voice", True)
+            )
+            
+            # Send quick replies after audio
+            if response_data.get("quick_replies"):
+                await asyncio.sleep(0.5)
+                await self.waha.send_quick_replies(
+                    chat_id=chat_id,
+                    text="💡 Doa lainnya:",
+                    quick_replies=response_data["quick_replies"]
+                )
+        
+        elif response_type == "image":
+            await self.waha.send_image(
+                chat_id=chat_id,
+                image_url=response_data["image_url"],
+                caption=response_data.get("caption")
+            )
+            
+            if response_data.get("follow_up_text"):
+                await asyncio.sleep(0.5)
+                await self.waha.send_message(chat_id, response_data["follow_up_text"])
+        
+        elif response_type == "location":
+            await self.waha.send_location(
+                chat_id=chat_id,
+                latitude=response_data["lat"],
+                longitude=response_data["lng"],
+                name=response_data.get("name"),
+                address=response_data.get("address")
+            )
+            
+            if response_data.get("text"):
+                await asyncio.sleep(0.3)
+                await self.waha.send_message(chat_id, response_data["text"])
+        
+        elif response_type == "document":
+            await self.waha.send_document(
+                chat_id=chat_id,
+                document_url=response_data["document_url"],
+                filename=response_data["filename"],
+                caption=response_data.get("caption")
+            )
+        
+        elif response_type == "multi":
+            # Send multiple messages in sequence
+            for item in response_data["messages"]:
+                await self._send_response(chat_id, item)
+                await asyncio.sleep(random.uniform(0.8, 1.5))
     
-    async def _log_analytics_safe(self, phone: str, intent: str, body: str, has_media: bool):
-        """Log analytics without blocking main flow"""
-        try:
-            await self.db.log_analytics("message_received", phone, {
-                "intent": intent,
-                "message_length": len(body),
-                "has_media": has_media,
-                "timestamp": datetime.now().isoformat()
-            })
-        except Exception as e:
-            logger.debug(f"Analytics logging failed (non-critical): {e}")
+    # ==================== INTERACTIVE RESPONSE HANDLING ====================
     
-    async def _save_conversation_safe(self, phone: str, role: str, content: str):
-        """Save conversation without blocking main flow"""
-        try:
-            await self.db.save_conversation(phone, role, content)
-        except Exception as e:
-            logger.debug(f"Conversation save failed (non-critical): {e}")
+    def _handle_interactive_response(self, response_id: str) -> Tuple[str, str]:
+        """Convert button/list ID to intent and body"""
+        mapping = {
+            # Main menu buttons
+            "menu_guide": ("guide", "panduan"),
+            "menu_doa": ("doa", "doa"),
+            "menu_cost": ("cost", "biaya"),
+            "menu_checklist": ("checklist", "checklist"),
+            "menu_visa": ("visa", "visa"),
+            "menu_rights": ("rights", "hak jamaah"),
+            "menu_agent": ("agent", "travel agent"),
+            "menu_ai": ("ai_chat", "chat ai"),
+            
+            # Guide sub-menu
+            "guide_ihram": ("guide", "ihram"),
+            "guide_tawaf": ("guide", "tawaf"),
+            "guide_sai": ("guide", "sai"),
+            "guide_tahallul": ("guide", "tahallul"),
+            
+            # Doa sub-menu
+            "doa_niat": ("doa", "niat umrah"),
+            "doa_talbiyah": ("doa", "talbiyah"),
+            "doa_tawaf": ("doa", "doa tawaf"),
+            "doa_sai": ("doa", "doa sai"),
+            "doa_zamzam": ("doa", "doa zamzam"),
+            
+            # Quick replies
+            "qr_0": ("menu", "menu"),
+            "qr_1": ("doa", "doa"),
+            "qr_2": ("guide", "panduan"),
+            
+            # Back buttons
+            "back_menu": ("menu", "menu"),
+            "back_doa": ("doa", "doa menu"),
+            "back_guide": ("guide", "panduan menu"),
+        }
+        
+        if response_id in mapping:
+            return mapping[response_id]
+        
+        # Default: treat as text
+        return ("ai_chat", response_id)
     
-    async def _route_intent(
+    # ==================== ENHANCED INTENT ROUTING ====================
+    
+    async def _route_intent_enhanced(
         self,
         intent: str,
         message: str,
         phone: str,
         is_new_user: bool
-    ) -> str:
-        """Route message to appropriate handler based on intent"""
+    ) -> Dict[str, Any]:
+        """Route to handler and return rich response data"""
         
-        # Welcome new users
         if is_new_user and intent == "greeting":
-            return await self._handle_new_user()
+            return await self._handle_new_user_enhanced()
         
-        # Intent routing
         handlers = {
-            "greeting": self._handle_greeting,
-            "menu": self._handle_menu,
-            "cost": self._handle_cost,
-            "guide": self._handle_guide,
-            "doa": self._handle_doa,
-            "visa": self._handle_visa,
-            "checklist": self._handle_checklist,
-            "rights": self._handle_rights,
-            "agent": self._handle_agent,
-            "thanks": self._handle_thanks,
-            "bye": self._handle_bye,
-            "ai_chat": self._handle_ai_chat,
+            "greeting": self._handle_greeting_enhanced,
+            "menu": self._handle_menu_enhanced,
+            "cost": self._handle_cost_enhanced,
+            "guide": self._handle_guide_enhanced,
+            "doa": self._handle_doa_enhanced,
+            "visa": self._handle_visa_enhanced,
+            "checklist": self._handle_checklist_enhanced,
+            "rights": self._handle_rights_enhanced,
+            "agent": self._handle_agent_enhanced,
+            "thanks": self._handle_thanks_enhanced,
+            "bye": self._handle_bye_enhanced,
+            "ai_chat": self._handle_ai_chat_enhanced,
+            "location": self._handle_location,
         }
         
-        handler = handlers.get(intent, self._handle_ai_chat)
+        handler = handlers.get(intent, self._handle_ai_chat_enhanced)
         return await handler(message, phone)
     
-    # ==================== INTENT HANDLERS ====================
+    # ==================== ENHANCED HANDLERS ====================
     
-    async def _handle_new_user(self) -> str:
-        """Handle new user welcome"""
-        return """🕌 *Assalamu'alaikum Warahmatullahi Wabarakatuh!*
+    async def _handle_new_user_enhanced(self) -> Dict[str, Any]:
+        """Welcome new user with buttons"""
+        return {
+            "type": "buttons",
+            "text": """🕌 *Assalamu'alaikum Warahmatullahi Wabarakatuh!*
 
 Selamat datang di *LABBAIK AI* - Asisten Perencanaan Umrah Indonesia! 🇮🇩
 
-Saya siap membantu Anda merencanakan ibadah Umrah dengan mudah dan informatif.
+Saya siap membantu Anda merencanakan ibadah Umrah dengan mudah.
 
-📋 *Yang bisa saya bantu:*
-• Panduan tata cara Umrah lengkap
-• Simulasi biaya & budgeting
-• Checklist persiapan
-• Doa-doa Umrah
-• Info visa & persyaratan
-• Hak-hak jamaah resmi
+Pilih menu di bawah untuk memulai:""",
+            "buttons": [
+                {"id": "menu_guide", "text": "📖 Panduan Umrah"},
+                {"id": "menu_doa", "text": "🤲 Doa & Dzikir"},
+                {"id": "menu_cost", "text": "💰 Simulasi Biaya"}
+            ],
+            "footer": "Atau ketik pertanyaan langsung"
+        }
+    
+    async def _handle_greeting_enhanced(self, message: str, phone: str) -> Dict[str, Any]:
+        """Greeting with main menu buttons"""
+        return await self._handle_menu_enhanced(message, phone)
+    
+    async def _handle_menu_enhanced(self, message: str, phone: str) -> Dict[str, Any]:
+        """Main menu with interactive list"""
+        return {
+            "type": "list",
+            "text": """🕌 *LABBAIK AI - Menu Utama*
 
-💬 Ketik *MENU* untuk melihat menu lengkap, atau langsung tanyakan apa saja!
-
-🌐 Website: labbaik-umrahplanner.streamlit.app
-
-_Semoga Allah memudahkan perjalanan Umrah Anda_ 🤲"""
+Pilih layanan yang Anda butuhkan:""",
+            "button_text": "📋 Lihat Menu",
+            "sections": [
+                {
+                    "title": "📚 Informasi Umrah",
+                    "rows": [
+                        {"id": "menu_guide", "title": "📖 Panduan Umrah", "description": "Ihram, Tawaf, Sa'i, Tahallul"},
+                        {"id": "menu_doa", "title": "🤲 Doa & Dzikir", "description": "Dengan audio bacaan"},
+                        {"id": "menu_rights", "title": "⚖️ Hak Jamaah", "description": "29 hak resmi dari Saudi"}
+                    ]
+                },
+                {
+                    "title": "💼 Perencanaan",
+                    "rows": [
+                        {"id": "menu_cost", "title": "💰 Simulasi Biaya", "description": "Estimasi budget umrah"},
+                        {"id": "menu_checklist", "title": "✅ Checklist", "description": "Persiapan keberangkatan"},
+                        {"id": "menu_visa", "title": "📝 Info Visa", "description": "Persyaratan & proses"}
+                    ]
+                },
+                {
+                    "title": "🤖 Lainnya",
+                    "rows": [
+                        {"id": "menu_agent", "title": "🔍 Cek Travel Agent", "description": "Verifikasi legalitas"},
+                        {"id": "menu_ai", "title": "💬 Tanya AI", "description": "Tanya apa saja tentang umrah"}
+                    ]
+                }
+            ],
+            "footer": "LABBAIK.AI - labbaik-umrahplanner.streamlit.app"
+        }
     
-    async def _handle_greeting(self, message: str, phone: str) -> str:
-        """Handle greeting messages"""
-        return MENU_TEMPLATES["main"]
-    
-    async def _handle_menu(self, message: str, phone: str) -> str:
-        """Handle menu request"""
-        return MENU_TEMPLATES["main"]
-    
-    async def _handle_cost(self, message: str, phone: str) -> str:
-        """Handle cost/pricing inquiries"""
-        message_lower = message.lower()
-        
-        sim_pattern = r'simulasi\s+(\d+)\s*(?:hari|days?)?\s+(\w+)\s+(\w+)'
-        match = re.search(sim_pattern, message_lower)
-        
-        if match:
-            duration = int(match.group(1))
-            month = match.group(2)
-            tier = match.group(3)
-            return await self.ai.generate_cost_simulation(duration, month, tier)
-        
-        return MENU_TEMPLATES["simulasi_biaya"]
-    
-    async def _handle_guide(self, message: str, phone: str) -> str:
-        """Handle umrah guide requests"""
+    async def _handle_guide_enhanced(self, message: str, phone: str) -> Dict[str, Any]:
+        """Guide menu or specific guide with infographic"""
         message_lower = message.lower()
         
         if any(word in message_lower for word in ['ihram', 'niat']):
-            return await self._get_ihram_guide()
+            return await self._get_ihram_guide_enhanced()
         elif any(word in message_lower for word in ['tawaf', 'thawaf']):
-            return await self._get_tawaf_guide()
+            return await self._get_tawaf_guide_enhanced()
         elif any(word in message_lower for word in ['sai', "sa'i"]):
-            return await self._get_sai_guide()
-        elif any(word in message_lower for word in ['tahallul', 'cukur', 'potong']):
-            return await self._get_tahallul_guide()
+            return await self._get_sai_guide_enhanced()
+        elif any(word in message_lower for word in ['tahallul', 'cukur']):
+            return await self._get_tahallul_guide_enhanced()
         else:
-            return MENU_TEMPLATES["panduan_umrah"]
-    
-    async def _handle_doa(self, message: str, phone: str) -> str:
-        """Handle doa/dzikir requests"""
-        message_lower = message.lower()
-        
-        if any(word in message_lower for word in ['niat', 'niat umrah']):
-            return DOA_TEMPLATES["niat_umrah"]
-        elif 'talbiyah' in message_lower or 'labbaik' in message_lower:
-            return DOA_TEMPLATES["talbiyah"]
-        elif 'tawaf' in message_lower:
-            return DOA_TEMPLATES["doa_tawaf"]
-        elif 'sai' in message_lower or "sa'i" in message_lower:
-            return DOA_TEMPLATES["doa_sai"]
-        elif 'zamzam' in message_lower:
-            return DOA_TEMPLATES["doa_zamzam"]
-        elif '1' in message_lower:
-            return DOA_TEMPLATES["niat_umrah"]
-        elif '2' in message_lower:
-            return DOA_TEMPLATES["talbiyah"]
-        elif '3' in message_lower:
-            return DOA_TEMPLATES["doa_tawaf"]
-        elif '4' in message_lower:
-            return DOA_TEMPLATES["doa_sai"]
-        elif '5' in message_lower:
-            return DOA_TEMPLATES["doa_zamzam"]
-        else:
-            return MENU_TEMPLATES["doa_menu"]
-    
-    async def _handle_visa(self, message: str, phone: str) -> str:
-        """Handle visa inquiries"""
-        return MENU_TEMPLATES["visa_info"]
-    
-    async def _handle_checklist(self, message: str, phone: str) -> str:
-        """Handle checklist requests"""
-        return MENU_TEMPLATES["checklist"]
-    
-    async def _handle_rights(self, message: str, phone: str) -> str:
-        """Handle jamaah rights inquiries"""
-        message_lower = message.lower()
-        
-        number_match = re.search(r'hak\s+(\d+)', message_lower)
-        if number_match:
-            right_num = int(number_match.group(1))
-            return await self._get_specific_right(right_num)
-        
-        return MENU_TEMPLATES["hak_jamaah"]
-    
-    async def _handle_agent(self, message: str, phone: str) -> str:
-        """Handle travel agent verification requests"""
-        return MENU_TEMPLATES["travel_agent"]
-    
-    async def _handle_thanks(self, message: str, phone: str) -> str:
-        """Handle thank you messages"""
-        return """Sama-sama! 🤲
+            # Show guide menu
+            return {
+                "type": "buttons",
+                "text": """📖 *Panduan Tata Cara Umrah*
 
-Senang bisa membantu perencanaan Umrah Anda.
-
-Ada lagi yang bisa saya bantu? Ketik *MENU* untuk menu utama.
-
-_Semoga Allah memudahkan dan mengabulkan niat Umrah Anda_ 🕌"""
+Pilih panduan yang ingin Anda pelajari:""",
+                "buttons": [
+                    {"id": "guide_ihram", "text": "1️⃣ Ihram"},
+                    {"id": "guide_tawaf", "text": "2️⃣ Tawaf"},
+                    {"id": "guide_sai", "text": "3️⃣ Sa'i"}
+                ],
+                "footer": "Ketik nama rukun untuk detail"
+            }
     
-    async def _handle_bye(self, message: str, phone: str) -> str:
-        """Handle goodbye messages"""
-        return """Wa'alaikumussalam Warahmatullahi Wabarakatuh! 👋
-
-Terima kasih telah menggunakan LABBAIK AI.
-
-Jangan ragu hubungi kami kapan saja untuk pertanyaan seputar Umrah.
-
-🌐 Website: labbaik-umrahplanner.streamlit.app
-
-_Sampai jumpa, semoga Allah selalu melindungi_ 🤲"""
-    
-    async def _handle_ai_chat(self, message: str, phone: str) -> str:
-        """Handle general AI chat for unrecognized intents"""
-        history = await self.db.get_conversation_history(
-            phone, 
-            settings.MAX_CONVERSATION_HISTORY
-        )
-        
-        response = await self.ai.generate_response(
-            message,
-            conversation_history=history
-        )
-        
-        return response
-    
-    # ==================== GUIDE CONTENT ====================
-    
-    async def _get_ihram_guide(self) -> str:
-        """Get detailed ihram guide"""
-        return """🕋 *Panduan Ihram*
+    async def _get_ihram_guide_enhanced(self) -> Dict[str, Any]:
+        """Ihram guide with image"""
+        text = """🕋 *Panduan Ihram*
 
 *Definisi:*
 Ihram adalah niat memulai ibadah Umrah dengan memakai pakaian ihram dan mengucapkan niat.
@@ -559,7 +445,7 @@ Ihram adalah niat memulai ibadah Umrah dengan memakai pakaian ihram dan mengucap
 1️⃣ *Persiapan Sebelum Miqat*
    • Mandi (sunnah)
    • Memakai wewangian (sebelum niat)
-   • Merapikan kuku, bulu ketiak, dll
+   • Merapikan kuku, bulu ketiak
 
 2️⃣ *Pakaian Ihram*
    👔 Pria: 2 kain putih tidak berjahit
@@ -567,27 +453,35 @@ Ihram adalah niat memulai ibadah Umrah dengan memakai pakaian ihram dan mengucap
 
 3️⃣ *Niat di Miqat*
    📖 لَبَّيْكَ اللَّهُمَّ عُمْرَةً
-   "Labbaika Allahumma 'Umratan"
+   _"Labbaika Allahumma 'Umratan"_
 
-4️⃣ *Talbiyah*
-   Dibaca terus sampai tawaf
+4️⃣ *Talbiyah* - Dibaca terus sampai tawaf
 
 *Larangan saat Ihram (Pria):*
-❌ Memakai pakaian berjahit
+❌ Pakaian berjahit
 ❌ Menutup kepala
-❌ Memakai wewangian
-❌ Memotong kuku/rambut
+❌ Wewangian
+❌ Potong kuku/rambut"""
 
-*Lokasi Miqat untuk WNI:*
-📍 Bir Ali (dari Madinah)
-📍 Yalamlam (via laut)
-📍 Pesawat: saat melewati Miqat
-
-Ada pertanyaan tentang ihram?"""
+        return {
+            "type": "multi",
+            "messages": [
+                {"type": "text", "text": text},
+                {
+                    "type": "buttons",
+                    "text": "🔊 Mau dengar audio niat ihram?",
+                    "buttons": [
+                        {"id": "doa_niat", "text": "🔊 Audio Niat"},
+                        {"id": "doa_talbiyah", "text": "🔊 Audio Talbiyah"},
+                        {"id": "back_menu", "text": "📋 Menu Utama"}
+                    ]
+                }
+            ]
+        }
     
-    async def _get_tawaf_guide(self) -> str:
-        """Get detailed tawaf guide"""
-        return """🕋 *Panduan Tawaf*
+    async def _get_tawaf_guide_enhanced(self) -> Dict[str, Any]:
+        """Tawaf guide"""
+        text = """🕋 *Panduan Tawaf*
 
 *Definisi:*
 Mengelilingi Ka'bah 7 putaran, dimulai dari Hajar Aswad.
@@ -597,143 +491,578 @@ Mengelilingi Ka'bah 7 putaran, dimulai dari Hajar Aswad.
 1️⃣ *Persiapan*
    • Berwudhu
    • Idhtiba (bahu kanan terbuka - pria)
-   • Posisi: Ka'bah di sebelah kiri
 
 2️⃣ *Mulai Tawaf*
-   • Sejajarkan dengan Hajar Aswad
-   • Cari lampu hijau sebagai penanda
-   • Angkat tangan, ucap "Bismillahi Allahu Akbar"
+   • Sejajarkan dengan Hajar Aswad (lampu hijau)
+   • Ucap: _Bismillahi Allahu Akbar_
 
 3️⃣ *7 Putaran*
-   • Jalan berlawanan arah jarum jam
-   • Ramal (jalan cepat) di 3 putaran awal (pria)
-   • Berdoa bebas sepanjang tawaf
+   • Berlawanan arah jarum jam
+   • Ka'bah di sebelah kiri
+   • Ramal di 3 putaran awal (pria)
 
-4️⃣ *Doa Khusus*
-   Antara Rukun Yamani & Hajar Aswad:
+4️⃣ *Doa di Rukun Yamani*
    رَبَّنَا آتِنَا فِي الدُّنْيَا حَسَنَةً...
 
 5️⃣ *Setelah Tawaf*
-   • Tutup bahu (pria)
-   • Shalat 2 rakaat di belakang Maqam Ibrahim
-   • Minum air Zamzam
+   • Shalat 2 rakaat di Maqam Ibrahim
+   • Minum air Zamzam"""
 
-*Tips:*
-💡 Lantai atas lebih longgar
-💡 Hindari foto agar tidak macet
-💡 Gunakan app Al Maqsad untuk navigasi
-
-Ketik *DOA TAWAF* untuk doa lengkapnya!"""
+        return {
+            "type": "multi",
+            "messages": [
+                {"type": "text", "text": text},
+                {
+                    "type": "buttons",
+                    "text": "🔊 Dengar doa tawaf?",
+                    "buttons": [
+                        {"id": "doa_tawaf", "text": "🔊 Audio Doa Tawaf"},
+                        {"id": "guide_sai", "text": "➡️ Lanjut Sa'i"},
+                        {"id": "back_menu", "text": "📋 Menu Utama"}
+                    ]
+                }
+            ]
+        }
     
-    async def _get_sai_guide(self) -> str:
-        """Get detailed sa'i guide"""
-        return """🏃 *Panduan Sa'i*
+    async def _get_sai_guide_enhanced(self) -> Dict[str, Any]:
+        """Sa'i guide"""
+        text = """🏃 *Panduan Sa'i*
 
 *Definisi:*
-Berjalan antara Bukit Shafa dan Marwah sebanyak 7 kali perjalanan.
+Berjalan antara Bukit Shafa dan Marwah 7 kali.
 
 *Langkah-langkah:*
 
-1️⃣ *Setelah Tawaf*
-   • Minum Zamzam (sunnah)
-   • Menuju Shafa
-
-2️⃣ *Di Bukit Shafa*
+1️⃣ *Mulai dari Shafa*
    • Menghadap Ka'bah
    • Baca: إِنَّ الصَّفَا وَالْمَرْوَةَ مِن شَعَائِرِ اللَّهِ
-   • Berdoa
 
-3️⃣ *Jalan ke Marwah*
-   • Shafa → Marwah = 1 perjalanan
-   • 🏃 Pria: Lari kecil di area lampu hijau
-   • Total: 7 perjalanan, berakhir di Marwah
+2️⃣ *7 Perjalanan*
+   • Shafa → Marwah = 1
+   • Marwah → Shafa = 2
+   • Berakhir di Marwah (ke-7)
 
-4️⃣ *Di Tiap Bukit*
-   • Berdoa menghadap Ka'bah
-   • Lanjut ke bukit berikutnya
+3️⃣ *Lari kecil (Pria)*
+   • Di area lampu hijau
+   • Wanita jalan biasa
 
-*Informasi:*
+*Info:*
 📏 Jarak 1x: 394 meter
-📏 Total 7x: 2.761 meter
-⏱️ Waktu: 45-55 menit
+📏 Total: 2.761 meter
+⏱️ Waktu: 45-55 menit"""
 
-*Tips:*
-💡 Bawa air minum
-💡 Gunakan lantai atas jika ramai
-💡 Kursi roda tersedia (app Tanaqol)
-
-Ketik *DOA SAI* untuk doa lengkapnya!"""
+        return {
+            "type": "multi",
+            "messages": [
+                {"type": "text", "text": text},
+                {
+                    "type": "buttons",
+                    "text": "🔊 Dengar doa sa'i?",
+                    "buttons": [
+                        {"id": "doa_sai", "text": "🔊 Audio Doa Sa'i"},
+                        {"id": "guide_tahallul", "text": "➡️ Lanjut Tahallul"},
+                        {"id": "back_menu", "text": "📋 Menu Utama"}
+                    ]
+                }
+            ]
+        }
     
-    async def _get_tahallul_guide(self) -> str:
-        """Get tahallul guide"""
-        return """✂️ *Panduan Tahallul*
+    async def _get_tahallul_guide_enhanced(self) -> Dict[str, Any]:
+        """Tahallul guide"""
+        return {
+            "type": "text",
+            "text": """✂️ *Panduan Tahallul*
 
 *Definisi:*
-Mencukur atau memotong rambut setelah selesai Sa'i, menandakan selesainya Umrah.
+Mencukur/memotong rambut setelah Sa'i = Umrah selesai!
 
 *Ketentuan:*
 
 👔 *Pria:*
    • Dicukur habis (lebih utama)
-   • Atau dipotong merata seluruh kepala
-   • Minimal: dipendekkan
+   • Atau dipotong merata
 
 👗 *Wanita:*
    • Potong ujung rambut 1-2 cm
    • Tidak boleh dicukur habis
 
 *Lokasi:*
-📍 Barbershop berlisensi sekitar Haram
-📍 Bisa di hotel
-📍 Bisa potong sendiri
-
-*Tips:*
-💡 Pilih barbershop berlisensi
-💡 Hindari tukang cukur ilegal
-💡 Barbershop buka 24 jam di musim ramai
+📍 Barbershop sekitar Haram
+📍 Di hotel
+📍 Potong sendiri
 
 *Setelah Tahallul:*
 ✅ Larangan ihram selesai
-✅ Boleh memakai pakaian biasa
 ✅ Umrah selesai!
 
 🤲 _Taqabbalallahu minna wa minkum_
 
-Ada pertanyaan lain?"""
+Ketik *MENU* untuk kembali."""
+        }
     
-    async def _get_specific_right(self, right_num: int) -> str:
-        """Get specific jamaah right by number"""
-        rights = {
-            1: "Semua pihak dalam sistem Umrah wajib melayani jamaah dengan amanah dan ikhlas",
-            2: "Jamaah dapat melacak status visa melalui visa.mofa.gov.sa",
-            3: "Travel agent wajib memberikan edukasi lengkap sebelum keberangkatan",
-            4: "Detail program harus transparan sebelum pembayaran",
-            5: "Penjemputan di bandara dan transfer ke akomodasi",
-            6: "Asuransi komprehensif 90 hari (kesehatan, kecelakaan, delay, repatriasi, COVID)",
-            7: "Pengurusan izin Umrah dan shalat di Raudhah",
-            8: "Boleh mengulang Umrah selama masa tinggal (1x di Ramadhan)",
-            9: "1 izin shalat di Raudhah setiap 365 hari",
-            10: "Layanan penuh sesuai kontrak (hotel, transport, ground service)",
-            11: "Verifikasi kesiapan layanan sebelum kedatangan",
-            12: "Opsi kendaraan pribadi jika tersedia",
-            13: "Bantuan jika tersesat untuk kembali ke akomodasi",
-            14: "Pengaturan rombongan ke Masjidil Haram & Masjid Nabawi",
-            15: "Boleh mengunjungi kota lain di Saudi dengan koordinasi",
-            16: "Tinggal maksimal 3 bulan atau sampai 1 Dzulqa'dah",
-            23: "Layanan darurat untuk insiden/kesehatan/kematian",
-            27: "Perlindungan HAM sesuai regulasi Saudi",
-            28: "Boleh melapor ke pihak keamanan jika ada masalah",
-            29: "Pengaduan 24/7: +966-920002814 atau mohcc@haj.gov.sa"
+    async def _handle_doa_enhanced(self, message: str, phone: str) -> Dict[str, Any]:
+        """Doa menu or specific doa with audio"""
+        message_lower = message.lower()
+        
+        # Map keywords to doa
+        doa_mapping = {
+            ('niat', 'niat umrah'): 'niat_umrah',
+            ('talbiyah', 'labbaik'): 'talbiyah',
+            ('tawaf', 'doa tawaf'): 'doa_tawaf',
+            ('sai', "sa'i", 'doa sai'): 'doa_sai',
+            ('zamzam', 'doa zamzam'): 'doa_zamzam',
         }
         
-        if right_num in rights:
-            return f"""⚖️ *Hak Jamaah #{right_num}*
+        selected_doa = None
+        for keywords, doa_key in doa_mapping.items():
+            if any(kw in message_lower for kw in keywords):
+                selected_doa = doa_key
+                break
+        
+        if selected_doa:
+            return await self._get_doa_with_audio(selected_doa)
+        
+        # Show doa menu
+        return {
+            "type": "list",
+            "text": """🤲 *Doa & Dzikir Umrah*
 
-{rights[right_num]}
+Pilih doa yang ingin Anda dengar dan pelajari:""",
+            "button_text": "📿 Pilih Doa",
+            "sections": [
+                {
+                    "title": "🕋 Doa Wajib Umrah",
+                    "rows": [
+                        {"id": "doa_niat", "title": "1️⃣ Niat Umrah", "description": "Dibaca saat ihram di Miqat"},
+                        {"id": "doa_talbiyah", "title": "2️⃣ Talbiyah", "description": "Labbaikallahumma labbaik..."},
+                        {"id": "doa_tawaf", "title": "3️⃣ Doa Tawaf", "description": "Rabbana atina fid-dunya..."},
+                        {"id": "doa_sai", "title": "4️⃣ Doa Sa'i", "description": "Di Shafa dan Marwah"},
+                        {"id": "doa_zamzam", "title": "5️⃣ Doa Zamzam", "description": "Saat minum air zamzam"}
+                    ]
+                }
+            ],
+            "footer": "Setiap doa dilengkapi audio 🔊"
+        }
+    
+    async def _get_doa_with_audio(self, doa_key: str) -> Dict[str, Any]:
+        """Get doa text with audio"""
+        doa_content = {
+            "niat_umrah": {
+                "title": "Niat Umrah",
+                "arabic": "لَبَّيْكَ اللَّهُمَّ عُمْرَةً",
+                "latin": "Labbaikallahumma 'umratan",
+                "meaning": "Aku memenuhi panggilan-Mu ya Allah untuk melaksanakan Umrah",
+                "when": "Dibaca saat memasuki Miqat"
+            },
+            "talbiyah": {
+                "title": "Talbiyah",
+                "arabic": "لَبَّيْكَ اللَّهُمَّ لَبَّيْكَ، لَبَّيْكَ لَا شَرِيْكَ لَكَ لَبَّيْكَ، إِنَّ الْحَمْدَ وَالنِّعْمَةَ لَكَ وَالْمُلْكَ، لَا شَرِيْكَ لَكَ",
+                "latin": "Labbaikallahumma labbaik, labbaika laa syariika laka labbaik, innal hamda wan ni'mata laka wal mulk, laa syariika lak",
+                "meaning": "Aku memenuhi panggilan-Mu ya Allah. Tiada sekutu bagi-Mu. Segala puji, nikmat dan kerajaan milik-Mu. Tiada sekutu bagi-Mu.",
+                "when": "Dibaca terus sejak ihram sampai mulai tawaf"
+            },
+            "doa_tawaf": {
+                "title": "Doa Tawaf",
+                "arabic": "رَبَّنَا آتِنَا فِي الدُّنْيَا حَسَنَةً وَفِي الآخِرَةِ حَسَنَةً وَقِنَا عَذَابَ النَّارِ",
+                "latin": "Rabbanaa aatinaa fid-dunyaa hasanatan wa fil-aakhirati hasanatan wa qinaa 'adzaaban-naar",
+                "meaning": "Ya Tuhan kami, berilah kami kebaikan di dunia dan di akhirat, dan peliharalah kami dari siksa neraka.",
+                "when": "Dibaca antara Rukun Yamani dan Hajar Aswad",
+                "source": "QS. Al-Baqarah: 201"
+            },
+            "doa_sai": {
+                "title": "Doa Sa'i di Shafa",
+                "arabic": "إِنَّ الصَّفَا وَالْمَرْوَةَ مِن شَعَائِرِ اللَّهِ، أَبْدَأُ بِمَا بَدَأَ اللهُ بِهِ",
+                "latin": "Innash-shafaa wal-marwata min sya'aa'irillah, abda'u bimaa bada'allahu bihi",
+                "meaning": "Sesungguhnya Shafa dan Marwah adalah syiar Allah. Aku mulai dengan apa yang Allah mulai.",
+                "when": "Dibaca di Bukit Shafa dan Marwah",
+                "source": "QS. Al-Baqarah: 158"
+            },
+            "doa_zamzam": {
+                "title": "Doa Minum Zamzam",
+                "arabic": "اللَّهُمَّ إِنِّي أَسْأَلُكَ عِلْمًا نَافِعًا وَرِزْقًا وَاسِعًا وَشِفَاءً مِنْ كُلِّ دَاءٍ",
+                "latin": "Allahumma innii as'aluka 'ilman naafi'an wa rizqan waasi'an wa syifaa'an min kulli daa'",
+                "meaning": "Ya Allah, aku memohon ilmu yang bermanfaat, rezeki yang luas, dan kesembuhan dari segala penyakit.",
+                "when": "Dibaca saat minum air Zamzam"
+            }
+        }
+        
+        doa = doa_content.get(doa_key)
+        if not doa:
+            return {"type": "text", "text": "Doa tidak ditemukan. Ketik *DOA* untuk menu doa."}
+        
+        text = f"""🤲 *{doa['title']}*
 
-📚 Sumber: Dokumen Hak Jamaah Umrah 1446H
-Kementerian Haji & Umrah Saudi Arabia
+📖 *Arab:*
+{doa['arabic']}
 
-Ketik *HAK* untuk melihat daftar lengkap."""
+📝 *Latin:*
+_{doa['latin']}_
+
+🇮🇩 *Arti:*
+{doa['meaning']}
+
+⏰ *Waktu:*
+{doa['when']}"""
+
+        if doa.get('source'):
+            text += f"\n\n📚 _{doa['source']}_"
+        
+        # Check if audio exists
+        audio_url = DOA_AUDIO_URLS.get(doa_key)
+        
+        if audio_url and "example.com" not in audio_url:
+            return {
+                "type": "audio",
+                "text": text,
+                "audio_url": audio_url,
+                "as_voice": True,
+                "quick_replies": ["Doa Lainnya", "Panduan", "Menu"]
+            }
         else:
-            return f"Hak nomor {right_num} tidak ditemukan. Ketik *HAK* untuk daftar lengkap (1-29)."
+            # No audio, just text with buttons
+            return {
+                "type": "buttons",
+                "text": text,
+                "buttons": [
+                    {"id": "back_doa", "text": "📿 Doa Lainnya"},
+                    {"id": "menu_guide", "text": "📖 Panduan"},
+                    {"id": "back_menu", "text": "📋 Menu"}
+                ]
+            }
+    
+    async def _handle_cost_enhanced(self, message: str, phone: str) -> Dict[str, Any]:
+        """Cost simulation with buttons"""
+        return {
+            "type": "buttons",
+            "text": """💰 *Simulasi Biaya Umrah*
+
+Pilih paket untuk melihat estimasi biaya:
+
+*Paket Ekonomi:* Rp 25-32 juta
+Hotel 3★, 500m-1km dari Masjid
+
+*Paket Standar:* Rp 32-42 juta
+Hotel 4★, 200-500m dari Masjid
+
+*Paket VIP:* Rp 45-75 juta
+Hotel 5★, dekat/view Masjid""",
+            "buttons": [
+                {"id": "cost_ekonomi", "text": "💵 Paket Ekonomi"},
+                {"id": "cost_standar", "text": "💳 Paket Standar"},
+                {"id": "cost_vip", "text": "💎 Paket VIP"}
+            ],
+            "footer": "Harga dapat berubah sesuai musim"
+        }
+    
+    async def _handle_visa_enhanced(self, message: str, phone: str) -> Dict[str, Any]:
+        """Visa info"""
+        return {
+            "type": "text",
+            "text": """📝 *Informasi Visa Umrah*
+
+*Persyaratan:*
+✅ Paspor (min. 6 bulan berlaku)
+✅ Foto 4x6 background putih
+✅ Vaksin Meningitis (min. 10 hari sebelum)
+✅ Bukti booking travel
+
+*Proses:*
+📅 Durasi: 3-7 hari kerja
+🔍 Tracking: visa.mofa.gov.sa
+
+*Masa Berlaku:*
+📆 Single/Multiple entry
+⏳ Tinggal maks. 90 hari
+
+*Biaya:*
+💰 Biasanya sudah termasuk paket travel
+
+*Tips:*
+💡 Pastikan paspor masih valid 6+ bulan
+💡 Foto harus terbaru & jelas
+💡 Vaksin di KKP atau RS rujukan
+
+Ketik *MENU* untuk kembali."""
+        }
+    
+    async def _handle_checklist_enhanced(self, message: str, phone: str) -> Dict[str, Any]:
+        """Checklist"""
+        return {
+            "type": "text",
+            "text": """✅ *Checklist Persiapan Umrah*
+
+*📄 Dokumen:*
+☐ Paspor (6+ bulan berlaku)
+☐ Visa Umrah
+☐ Tiket pesawat PP
+☐ Bukti booking hotel
+☐ Kartu vaksin
+☐ Fotokopi dokumen (2 set)
+☐ Pas foto cadangan
+
+*👔 Pakaian Pria:*
+☐ Kain ihram 2 set
+☐ Sandal ihram
+☐ Baju ganti 5-7 set
+☐ Jaket/sweater
+
+*👗 Pakaian Wanita:*
+☐ Mukena 2-3 set
+☐ Jilbab/kerudung
+☐ Baju ganti 5-7 set
+☐ Kaos kaki
+
+*💊 Kesehatan:*
+☐ Obat pribadi
+☐ Obat maag/diare
+☐ Vitamin
+☐ Masker
+☐ Hand sanitizer
+
+*📱 Elektronik:*
+☐ HP + charger
+☐ Power bank
+☐ Adaptor (Type G)
+
+*🛍️ Lainnya:*
+☐ Uang SAR
+☐ Tas kecil
+☐ Buku doa
+☐ Tasbih
+
+Ketik *MENU* untuk kembali."""
+        }
+    
+    async def _handle_rights_enhanced(self, message: str, phone: str) -> Dict[str, Any]:
+        """Jamaah rights"""
+        return {
+            "type": "text",
+            "text": """⚖️ *Hak Jamaah Umrah (29 Hak Resmi)*
+
+*Pelayanan:*
+1️⃣ Dilayani dengan amanah & ikhlas
+2️⃣ Tracking visa di visa.mofa.gov.sa
+3️⃣ Edukasi lengkap sebelum berangkat
+4️⃣ Transparansi detail program
+
+*Akomodasi & Transport:*
+5️⃣ Penjemputan di bandara
+6️⃣ Asuransi komprehensif 90 hari
+10. Layanan sesuai kontrak
+
+*Ibadah:*
+7️⃣ Pengurusan izin Umrah & Raudhah
+8️⃣ Boleh mengulang Umrah (1x Ramadhan)
+9️⃣ 1x izin Raudhah per 365 hari
+
+*Darurat:*
+23. Layanan darurat 24/7
+29. Hotline: +966-920002814
+
+📚 Sumber: Kementerian Haji & Umrah Saudi 1446H
+
+Ketik *HAK [nomor]* untuk detail, misal: HAK 6
+
+Ketik *MENU* untuk kembali."""
+        }
+    
+    async def _handle_agent_enhanced(self, message: str, phone: str) -> Dict[str, Any]:
+        """Travel agent verification"""
+        return {
+            "type": "text",
+            "text": """🔍 *Verifikasi Travel Agent*
+
+*Cek di:*
+🌐 simpu.kemenag.go.id
+
+*Pastikan:*
+✅ Izin resmi dari Kemenag
+✅ Terdaftar di SIMPU
+✅ Akreditasi masih berlaku
+✅ Rekam jejak positif
+
+*🚨 Red Flags:*
+❌ Harga terlalu murah
+❌ Tidak ada izin resmi
+❌ Minta bayar full di awal
+❌ Tidak ada kontrak tertulis
+❌ Alamat kantor tidak jelas
+
+*💡 Tips:*
+• Minta referensi jamaah sebelumnya
+• Bandingkan 3+ travel
+• Baca kontrak teliti
+• Simpan bukti pembayaran
+
+Ketik *MENU* untuk kembali."""
+        }
+    
+    async def _handle_thanks_enhanced(self, message: str, phone: str) -> Dict[str, Any]:
+        """Thank you"""
+        return {
+            "type": "buttons",
+            "text": """Sama-sama! 🤲
+
+Senang bisa membantu perencanaan Umrah Anda.
+
+_Semoga Allah memudahkan perjalanan Umrah Anda_""",
+            "buttons": [
+                {"id": "back_menu", "text": "📋 Menu Utama"},
+                {"id": "menu_doa", "text": "🤲 Lihat Doa"},
+                {"id": "menu_guide", "text": "📖 Panduan"}
+            ]
+        }
+    
+    async def _handle_bye_enhanced(self, message: str, phone: str) -> Dict[str, Any]:
+        """Goodbye"""
+        return {
+            "type": "text",
+            "text": """Wa'alaikumussalam Warahmatullahi Wabarakatuh! 👋
+
+Terima kasih telah menggunakan *LABBAIK AI*.
+
+Hubungi kami kapan saja untuk pertanyaan seputar Umrah.
+
+🌐 labbaik-umrahplanner.streamlit.app
+
+_Sampai jumpa, semoga Allah melindungi_ 🤲"""
+        }
+    
+    async def _handle_location(self, message: str, phone: str) -> Dict[str, Any]:
+        """Handle location requests"""
+        message_lower = message.lower()
+        
+        if 'kbri' in message_lower and 'jeddah' in message_lower:
+            loc = LOCATIONS["kbri_jeddah"]
+        elif 'kbri' in message_lower and 'riyadh' in message_lower:
+            loc = LOCATIONS["kbri_riyadh"]
+        elif 'masjidil haram' in message_lower or 'makkah' in message_lower:
+            loc = LOCATIONS["masjidil_haram"]
+        elif 'masjid nabawi' in message_lower or 'madinah' in message_lower:
+            loc = LOCATIONS["masjid_nabawi"]
+        else:
+            return {"type": "text", "text": "Lokasi tidak ditemukan. Coba: KBRI Jeddah, Masjidil Haram, dll."}
+        
+        return {
+            "type": "location",
+            "lat": loc["lat"],
+            "lng": loc["lng"],
+            "name": loc["name"],
+            "address": loc["address"]
+        }
+    
+    async def _handle_ai_chat_enhanced(self, message: str, phone: str) -> Dict[str, Any]:
+        """AI chat"""
+        history = await self.db.get_conversation_history(phone, settings.MAX_CONVERSATION_HISTORY)
+        response = await self.ai.generate_response(message, conversation_history=history)
+        
+        return {
+            "type": "buttons",
+            "text": response,
+            "buttons": [
+                {"id": "back_menu", "text": "📋 Menu Utama"}
+            ],
+            "footer": "Powered by LABBAIK AI"
+        }
+    
+    # ==================== UTILITY METHODS ====================
+    
+    async def _send_limit_reached_message(self, chat_id: str):
+        """Send limit message"""
+        await self.waha.send_message(chat_id, """⚠️ *Batas Harian Tercapai*
+
+Anda telah mencapai batas penggunaan harian.
+Batas reset pukul 00:00 WIB.
+
+🌐 Kunjungi: labbaik-umrahplanner.streamlit.app""")
+    
+    async def _send_ai_limit_message(self, chat_id: str):
+        """Send AI limit message"""
+        await self.waha.send_buttons(
+            chat_id=chat_id,
+            text=f"""⚠️ *Batas AI Chat Tercapai*
+
+Anda telah menggunakan {self.DAILY_AI_CHAT_LIMIT}x AI chat hari ini.
+
+Gunakan menu lain atau tunggu besok.""",
+            buttons=[
+                {"id": "back_menu", "text": "📋 Menu Utama"},
+                {"id": "menu_doa", "text": "🤲 Doa"},
+                {"id": "menu_guide", "text": "📖 Panduan"}
+            ]
+        )
+    
+    async def _simulate_typing(self, response_data: Dict[str, Any], chat_id: str, intent: str):
+        """Simulate typing based on response"""
+        response_type = response_data.get("type", "text")
+        text_len = len(response_data.get("text", ""))
+        
+        if response_type in ["audio", "image", "document"]:
+            duration = random.uniform(2, 4)
+        elif intent in ["greeting", "menu", "thanks", "bye"]:
+            duration = random.uniform(*self.TYPING_DURATION_SHORT)
+        elif text_len < 500:
+            duration = random.uniform(*self.TYPING_DURATION_MEDIUM)
+        else:
+            duration = random.uniform(*self.TYPING_DURATION_LONG)
+        
+        elapsed = 0
+        while elapsed < duration:
+            await asyncio.sleep(min(5.0, duration - elapsed))
+            elapsed += 5.0
+            if elapsed < duration:
+                await self.waha.start_typing(chat_id)
+    
+    def _extract_phone_for_db(self, jid: str) -> str:
+        return jid.split("@")[0] if "@" in jid else jid
+    
+    def _check_rate_limit(self, phone: str) -> bool:
+        now = datetime.now()
+        if phone in self._user_last_message:
+            if (now - self._user_last_message[phone]).total_seconds() > 60:
+                self._user_message_count[phone] = 0
+        self._user_last_message[phone] = now
+        self._user_message_count[phone] = self._user_message_count.get(phone, 0) + 1
+        return self._user_message_count[phone] <= self.RATE_LIMIT_PER_MINUTE
+    
+    def _reset_daily_stats_if_needed(self):
+        today = date.today()
+        if today != self._current_date:
+            self._daily_stats = {}
+            self._current_date = today
+    
+    def _get_user_daily_stats(self, phone: str) -> Dict[str, Any]:
+        self._reset_daily_stats_if_needed()
+        if phone not in self._daily_stats:
+            self._daily_stats[phone] = {"message_count": 0, "ai_chat_count": 0, "limit_notified": False}
+        return self._daily_stats[phone]
+    
+    def _check_daily_limit(self, phone: str) -> Dict[str, Any]:
+        stats = self._get_user_daily_stats(phone)
+        if stats["message_count"] >= self.DAILY_MESSAGE_LIMIT:
+            return {"allowed": False, "notified_today": stats["limit_notified"]}
+        return {"allowed": True}
+    
+    def _check_ai_chat_limit(self, phone: str) -> bool:
+        return self._get_user_daily_stats(phone)["ai_chat_count"] < self.DAILY_AI_CHAT_LIMIT
+    
+    def _increment_daily_count(self, phone: str):
+        self._get_user_daily_stats(phone)["message_count"] += 1
+    
+    def _increment_ai_chat_count(self, phone: str):
+        self._get_user_daily_stats(phone)["ai_chat_count"] += 1
+    
+    def _mark_limit_notified(self, phone: str):
+        self._get_user_daily_stats(phone)["limit_notified"] = True
+    
+    async def _log_analytics_safe(self, phone: str, intent: str, body: str, has_media: bool):
+        try:
+            await self.db.log_analytics("message_received", phone, {"intent": intent, "message_length": len(body)})
+        except:
+            pass
+    
+    async def _save_conversation_safe(self, phone: str, role: str, content: str):
+        try:
+            await self.db.save_conversation(phone, role, content)
+        except:
+            pass
